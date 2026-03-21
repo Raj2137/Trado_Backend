@@ -1,6 +1,8 @@
 import logging
 
 import ccxt
+import time
+
 
 from app.core.config import settings
 
@@ -18,7 +20,8 @@ class BinanceService:
             "apiKey": settings.BINANCE_API_KEY,
             "secret": settings.BINANCE_SECRET_KEY,
             "enableRateLimit": True,
-        })
+             "timeout": 30000,  # 30 seconds
+          })
         self._markets = None
 
     def get_price(self, symbol: str):
@@ -30,11 +33,21 @@ class BinanceService:
         if not self.paper_trading:
             return 0.0
         return abs(notional_usdt) * self.paper_trading_fee_rate
+    
+    def safe_load_markets(self, retries=3):
+        for attempt in range(retries):
+            try:
+                return self.exchange.load_markets()
+            except Exception as e:
+                logger.warning(f"Retry {attempt+1}: {e}")
+                time.sleep(2)
+
+        raise Exception("Failed to load markets after retries")
 
     def _load_markets(self):
         # Cache market metadata because fee conversion may need base and quote assets.
         if self._markets is None:
-            self._markets = self.exchange.load_markets()
+            self._markets = self.safe_load_markets()
         return self._markets
 
     def _get_market_assets(self, symbol):

@@ -40,7 +40,8 @@ class CoinSelector:
     def __init__(self):
         # Initialize the exchange client with built-in rate limiting.
         self.exchange = ccxt.binance({
-            "enableRateLimit": True
+            "enableRateLimit": True,
+            "timeout": 30000,  # 30 seconds
         })
 
         # Minimum 24h notional volume to avoid thin markets.
@@ -58,8 +59,8 @@ class CoinSelector:
 
         # Require enough recent momentum so the shortlist is biased toward
         # active trend candidates instead of merely stable liquid coins.
-        self.MIN_6H_MOMENTUM = 0.005   # 0.5%
-        self.MIN_24H_MOMENTUM = 0.015  # 1.5%
+        self.MIN_6H_MOMENTUM = 0.003   # 0.2%
+        self.MIN_24H_MOMENTUM = 0.009   # 1.5%
 
         # Fetch a deeper history so the selector can screen for legitimate,
         # established names before running the recent rank/backtest passes.
@@ -80,7 +81,7 @@ class CoinSelector:
         self.STOP_LOSS_PCT = -0.02
 
         # Only deeply inspect the most liquid names to keep the scan focused.
-        self.SCAN_LIMIT = 120
+        self.SCAN_LIMIT = 45
 
     def _safe_ratio(self, numerator, denominator):
         # Protect ratio calculations from division-by-zero.
@@ -356,11 +357,22 @@ class CoinSelector:
             "profit_lock_step_pct": self.LOCK_PROFILE_OPTIONS[0]["profit_lock_step_pct"],
             "lock_rule_label": self.LOCK_PROFILE_OPTIONS[0]["lock_rule_label"],
         }
+    def safe_load_markets(self, retries=3):
+            for attempt in range(retries):
+                try:
+                    return self.exchange.load_markets()
+                except Exception as e:
+                    logger.warning(f"Retry {attempt+1} loading markets: {e}")
+                    time.sleep(2)
+
+            raise Exception("Failed to load markets after retries")
 
     def get_top_coins(self, limit=10):
         # Load market metadata once so symbol-level checks are cheap.
         logger.info("Loading markets...")
-        markets = self.exchange.load_markets()
+        
+        
+        markets = self.safe_load_markets()
 
         # Pull all ticker snapshots so we can prefilter by live liquidity.
         logger.info("Fetching tickers...")
@@ -497,7 +509,7 @@ class CoinSelector:
                 # Look for coins that are moving enough to trade, but not chaotically.
                 recent_closes = ranking_closes
                 volatility = (max(recent_closes) - min(recent_closes)) / min(recent_closes)
-                if volatility < 0.04 or volatility > 0.45:
+                if volatility < 0.02 or volatility > 0.50:
                     continue
                 volatility_score = self._clamp(volatility / 0.20)
 
@@ -508,7 +520,7 @@ class CoinSelector:
 
                 # Require recent activity to at least match the baseline.
                 volume_spike = recent_volume / avg_volume if avg_volume > 0 else 0
-                if volume_spike < 0.9:
+                if volume_spike <  0.7:
                     continue
 
                 # Stronger volume confirmation gets a better score.
