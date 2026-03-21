@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 TOTAL_CAPITAL = 100
 MONITOR_INTERVAL_SECONDS = 60
-SCAN_INTERVAL_SECONDS = 120
+SCAN_INTERVAL_SECONDS = 300
 
 
 def parse_args():
@@ -104,6 +104,7 @@ def scan_and_allocate(selector):
 
 
 def main():
+   
     args = parse_args()
     paper_trading = args.trade_mode == "paper"
 
