@@ -622,9 +622,26 @@ class CoinSelector:
         for candidate in selector_shortlist:
             backtest_ohlcv = candidate.pop("backtest_ohlcv")
 
-            # Backtest the exit rule on recent historical setups to help
-            # rank the selector-shortlisted coins and choose the lock rule.
+            # Run a recent historical simulation (backtest) on this coin to:
+            # 1. Validate that the strategy is actually profitable on this asset
+            # 2. Filter out coins that show weak or negative performance
+            # 3. Determine the best profit-lock configuration for this coin
+            #
+            # NOTE:
+            # Earlier, backtesting was only used for ranking, which allowed
+            # unprofitable coins (e.g., negative avg return, low win rate)
+            # to still be selected based purely on momentum.
+            #
+            # Now, backtest acts as a quality gate BEFORE ranking.
+            # Only coins with acceptable historical performance are allowed through.
             backtest = self._backtest_strategy(backtest_ohlcv)
+
+            # Filter out weak / unprofitable candidates early
+            # This prevents capital allocation to coins that historically
+            # do not respond well to the strategy.
+            if backtest["score"] < 0.3:
+                continue
+
 
             # Combine live momentum and historical strategy behavior into
             # one final ranking score without changing shortlist membership.
