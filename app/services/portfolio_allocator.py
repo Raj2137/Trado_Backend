@@ -1,8 +1,8 @@
 class PortfolioAllocator:
     # Explicit deployment rules for concentrated baskets with only a few names.
-    SINGLE_COIN_WEIGHTS = [0.30]
-    TWO_COIN_WEIGHTS = [0.30, 0.25]
-    THREE_COIN_WEIGHTS = [0.40, 0.30, 0.30]
+    SINGLE_COIN_WEIGHTS = [1.0]        # 100%
+    TWO_COIN_WEIGHTS = [0.5, 0.5]      # 50-50
+    THREE_COIN_WEIGHTS = [0.4, 0.3, 0.3]  # keep same
 
     @classmethod
     def _normalize_weights(cls, weights):
@@ -100,6 +100,17 @@ class PortfolioAllocator:
 
         if not allocations:
             return None, allocation_order
+        
+        # 🔥 Ensure FULL capital deployment (CRITICAL FIX)
+        # If any capital is left unused (due to rounding or min_trade_size),
+        # assign it to the top-ranked coin instead of leaving it idle.
+
+        leftover_capital = total_capital - deployed_capital
+
+        if leftover_capital >= min_trade_size and allocations:
+            allocations[0]["amount_usdt"] += leftover_capital
+            allocations[0]["allocation_pct"] += (leftover_capital / total_capital) * 100
+            deployed_capital += leftover_capital
 
         recommended_profile = {
             "name": "adaptive_backtest_weighted",

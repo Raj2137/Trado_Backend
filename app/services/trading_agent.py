@@ -33,12 +33,12 @@ class PortfolioAgent:
         self.monitor_interval_seconds = monitor_interval_seconds
 
         # Exit any trade that falls 2% below entry.
-        self.stop_loss_pct = -0.02
-        self.weak_position_exit_pct = -0.015
+        self.stop_loss_pct = -0.015        # -1.5%
+        self.weak_position_exit_pct = -0.01  # -1%
         self.recommendation_exit_top_n = 4
 
         # Default trailing lock configuration when no coin-specific rule exists.
-        self.default_profit_lock_start_pct = 0.01
+        self.default_profit_lock_start_pct = 0.015  # 1.5%
         self.default_profit_lock_step_pct = 0.01
 
         # Track all live positions keyed by symbol.
@@ -101,6 +101,7 @@ class PortfolioAgent:
         profit_lock_start_pct,
         profit_lock_step_pct,
         lock_rule_label,
+        # entry_time
     ):
         # Store the state required to manage the live trailing lock.
         return {
@@ -115,6 +116,7 @@ class PortfolioAgent:
             "profit_lock_start_pct": profit_lock_start_pct,
             "profit_lock_step_pct": profit_lock_step_pct,
             "lock_rule_label": lock_rule_label,
+            # "entry_time": time.time(),
         }
 
     def _update_profit_lock(self, position, pnl_pct):
@@ -440,36 +442,201 @@ class PortfolioAgent:
             "pnl_usdt": pnl_usdt,
             "pnl_pct": pnl_pct,
         }
+    
+    
+    def partial_close_position(self, symbol, fraction, reason):
+        """
+        Sell a fraction of an existing position (0 < fraction <= 1)
+        """
 
+        if symbol not in self.positions:
+            return None
+
+        position = self.positions[symbol]
+
+        if fraction <= 0:
+            return None
+
+        fraction = min(fraction, 1.0)
+
+        sell_quantity = position["quantity"] * fraction
+
+        price = self.binance.get_price(symbol)
+        order = self.binance.sell(symbol, sell_quantity, price=price)
+
+        gross_value = order.get("gross_notional_usdt", sell_quantity * price)
+        sell_fee = order.get("fee_usdt", self.binance.estimate_fee(gross_value))
+        net_value = order.get("net_proceeds_usdt", gross_value - sell_fee)
+
+        # Reduce position size
+        position["quantity"] -= sell_quantity
+
+        # Proportional cost reduction
+        proportion = sell_quantity / (sell_quantity + position["quantity"] + 1e-8)
+        position["initial_usdt"] *= (1 - proportion)
+
+        position["total_fees_usdt"] += sell_fee
+
+        self._increase_available_usdt(net_value)
+
+        logger.info(
+            "PARTIAL SELL %s | fraction=%.2f | qty=%.6f | net=%.2f | reason=%s",
+            symbol,
+            fraction,
+            sell_quantity,
+            net_value,
+            reason,
+        )
+
+        # If nearly empty → fully remove
+        if position["quantity"] <= 1e-8:
+            del self.positions[symbol]
+
+        return net_value
     def close_position(self, symbol, exit_reason):
         # Public close helper used by the monitoring and rescan refill logic.
         snapshot = self.get_position_snapshot(symbol)
         return self._close_position(symbol, exit_reason, snapshot["price"])
 
     def rotate_positions(self, desired_allocations):
-        # On each independent rescan, only refill slots created by
-        # positions that were already closed. Do not force-sell live holdings.
+        """
+        Smart rotation logic (SAFE VERSION)
+
+        Goals:
+        - Use free cash first
+        - Protect strong winners
+        - Replace weak positions
+        - Avoid unnecessary churn
+        """
+
         if not desired_allocations:
             return []
 
-        current_symbols = set(self.positions.keys())
-        vacant_slots = max(len(desired_allocations) - len(current_symbols), 0)
-        if vacant_slots <= 0:
-            logger.info("Rescan produced no vacant slots to refill")
-            return []
-
-        candidate_allocations = [
-            allocation
-            for allocation in desired_allocations
-            if allocation["symbol"] not in current_symbols
-        ]
-        if not candidate_allocations:
-            logger.info("Rescan produced no new symbols for the vacant slots")
-            return []
-
         refills = []
-        for allocation in candidate_allocations[:vacant_slots]:
+
+        # Map desired allocations by symbol for quick lookup
+        desired_map = {a["symbol"]: a for a in desired_allocations}
+        current_symbols = set(self.positions.keys())
+
+        # -------------------------------
+        # STEP 1: Try to BUY using FREE CASH
+        # -------------------------------
+        for allocation in desired_allocations:
+            symbol = allocation["symbol"]
+
+            if symbol in current_symbols:
+                continue
+
+            if not self.has_trading_capital():
+                break
+
+            new_position = self.buy_position(
+                symbol,
+                allocation["amount_usdt"],
+                profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
+                profit_lock_step_pct=allocation.get("profit_lock_step_pct"),
+                lock_rule_label=allocation.get("lock_rule_label"),
+            )
+
+            if new_position:
+                refills.append({
+                    "bought_symbol": symbol,
+                    "buy_amount": new_position["initial_usdt"],
+                })
+
+        # -------------------------------
+        # STEP 2: Evaluate rotation (ONLY if no free cash)
+        # -------------------------------
+        if self.has_trading_capital():
+            return refills  # cash handled everything
+
+        ranked_positions = self.get_ranked_positions_by_pnl()
+
+        for allocation in desired_allocations:
             new_symbol = allocation["symbol"]
+
+            if new_symbol in current_symbols:
+                continue
+
+            if not ranked_positions:
+                break
+
+            # Worst performing position
+            weakest = ranked_positions[0]
+            weak_symbol = weakest["symbol"]
+            weak_pnl = weakest["pnl_pct"]
+
+            # -------------------------------
+            # RULE 1: Protect strong winners
+            # -------------------------------
+            if weak_pnl > 0.01:
+                logger.info(
+                    "Skipping rotation: %s is strong (pnl=%.2f%%)",
+                    weak_symbol,
+                    weak_pnl * 100,
+                )
+                continue
+
+            # -------------------------------
+            # RULE 2: Only rotate if weak
+            # -------------------------------
+            if weak_pnl > -0.003:
+                logger.info(
+                    "Skipping rotation: %s not weak enough (pnl=%.2f%%)",
+                    weak_symbol,
+                    weak_pnl * 100,
+                )
+                continue
+
+            # -------------------------------
+            # RULE 3: Rotate weak → new
+            # -------------------------------
+            logger.info(
+                "ROTATION: Selling %s (pnl=%.2f%%) → Buying %s",
+                weak_symbol,
+                weak_pnl * 100,
+                new_symbol,
+            )
+
+            # -------------------------------
+            # PARTIAL ROTATION DECISION
+            # -------------------------------
+            if weak_pnl > 0.01:
+                rotate_fraction = 0.0  # strong → ignore
+            elif weak_pnl > 0:
+                rotate_fraction = 0.2  # neutral → small
+            elif weak_pnl > -0.005:
+                rotate_fraction = 0.5  # weak → medium
+            else:
+                rotate_fraction = 1.0  # very weak → full
+
+            if rotate_fraction == 0:
+                logger.info("Skipping rotation: %s is strong", weak_symbol)
+                continue
+
+            logger.info(
+                "ROTATION (partial): %s | pnl=%.2f%% | fraction=%.2f → %s",
+                weak_symbol,
+                weak_pnl * 100,
+                rotate_fraction,
+                new_symbol,
+            )
+
+            if rotate_fraction < 1.0:
+                closed = self.partial_close_position(
+                    weak_symbol,
+                    rotate_fraction,
+                    "partial_rotation"
+                )
+            else:
+                closed = self.close_position(
+                    weak_symbol,
+                    "full_rotation"
+                )
+
+            if not closed:
+                continue
+
             new_position = self.buy_position(
                 new_symbol,
                 allocation["amount_usdt"],
@@ -477,26 +644,27 @@ class PortfolioAgent:
                 profit_lock_step_pct=allocation.get("profit_lock_step_pct"),
                 lock_rule_label=allocation.get("lock_rule_label"),
             )
-            if new_position is None:
-                continue
 
-            refills.append({
-                "bought_symbol": new_symbol,
-                "buy_amount": new_position["initial_usdt"],
-            })
-            logger.info(
-                "REFILL slot with %s | allocation=%.2f USDT | lock_rule=%s",
-                new_symbol,
-                new_position["initial_usdt"],
-                new_position["lock_rule_label"],
-            )
+            if new_position:
+                refills.append({
+                    "sold_symbol": weak_symbol,
+                    "bought_symbol": new_symbol,
+                    "buy_amount": new_position["initial_usdt"],
+                })
+
+                # Update state
+                current_symbols.remove(weak_symbol)
+                current_symbols.add(new_symbol)
+                ranked_positions = self.get_ranked_positions_by_pnl()
 
         if not refills:
-            logger.info("No vacant slots were refilled after the latest rescan")
+            logger.info("No rotations or refills performed")
 
         return refills
 
     def monitor_positions_once(self):
+        
+        
         # Process one monitoring tick so the caller can interleave 1-minute
         # monitoring with the independent rescan loop.
         if not self.positions:
@@ -508,7 +676,8 @@ class PortfolioAgent:
         for symbol in list(self.positions.keys()):
             position = self.positions[symbol]
             price = self.binance.get_price(symbol)
-            pnl_pct = (price - position["entry_price"]) / position["entry_price"]
+
+            
             gross_current_value = position["quantity"] * price
             estimated_sell_fee_usdt = self.binance.estimate_fee(gross_current_value)
             pnl_usdt = (
@@ -517,6 +686,7 @@ class PortfolioAgent:
                 - position["initial_usdt"]
                 - position["buy_fee_usdt"]
             )
+            pnl_pct = pnl_usdt / position["initial_usdt"]  # ✅ NET PnL
             net_pnl_pct = pnl_usdt / position["initial_usdt"]
 
             if pnl_pct > position["highest_pnl_pct"]:
