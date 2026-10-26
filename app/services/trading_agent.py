@@ -1,5 +1,6 @@
 import logging
 import time
+from datetime import date
 
 from app.core.config import settings
 from app.services.binance_service import BinanceService
@@ -26,11 +27,13 @@ class PortfolioAgent:
         )
         self.available_usdt = self.starting_capital_usdt
         self.capital_epsilon_usdt = 1e-8
-        self.capital_reserve_usdt = (
-            0.0
-            if self.starting_capital_usdt is None
-            else self.starting_capital_usdt * (1 - settings.INITIAL_DEPLOYMENT_RATIO)
-        )
+        # The approved basket is fully deployed. A tiny balance may remain to
+        # cover an exchange fee, but it is not an intentional cash reserve.
+        self.capital_reserve_usdt = 0.0
+        self.daily_loss_limit_pct = settings.DAILY_LOSS_LIMIT_PCT
+        self.daily_equity_baseline_usdt = self.starting_capital_usdt
+        self.daily_equity_date = date.today()
+        self.daily_trading_halted = False
         # Use one Binance service for the whole portfolio run.
         self.binance = BinanceService(paper_trading=paper_trading)
         self.paper_trading = self.binance.paper_trading
@@ -43,8 +46,8 @@ class PortfolioAgent:
         self.weak_position_exit_pct = -0.01  # -1%
         self.recommendation_exit_top_n = 10
 
-        # At +2%, protect at least +1%. Thereafter, exit after a 2 percentage
-        # point drawdown from the highest net PnL reached by the position.
+        # At +2% net PnL, preserve a fixed +2% net-profit floor. This avoids
+        # giving back a winner merely because it retraced from a later peak.
         self.default_profit_lock_start_pct = settings.PROFIT_LOCK_START_PCT
         self.default_profit_lock_floor_pct = settings.PROFIT_LOCK_FLOOR_PCT
         self.default_profit_lock_drawdown_pct = settings.PROFIT_LOCK_DRAWDOWN_PCT
@@ -81,6 +84,49 @@ class PortfolioAgent:
             self.available_usdt - self.capital_reserve_usdt
             >= self.min_trade_size_usdt
         )
+
+    def _rollover_daily_loss_guard(self, equity_usdt=None):
+        """Start a fresh daily loss budget when the local calendar day changes."""
+        current_day = date.today()
+        if current_day == self.daily_equity_date:
+            return
+        self.daily_equity_date = current_day
+        self.daily_equity_baseline_usdt = (
+            equity_usdt if equity_usdt is not None else self.available_usdt
+        )
+        self.daily_trading_halted = False
+        logger.info(
+            "Daily-loss circuit breaker reset | opening equity=%.2f USDT",
+            self.daily_equity_baseline_usdt or 0.0,
+        )
+
+    def is_daily_trading_halted(self):
+        """Return whether new entries are suspended for the current day."""
+        self._rollover_daily_loss_guard()
+        return self.daily_trading_halted
+
+    def _evaluate_daily_loss_guard(self, equity_usdt):
+        """Disable new entries when daily portfolio drawdown reaches the limit.
+
+        Existing positions keep their ordinary stop-loss and locked-profit
+        monitoring. The circuit breaker does not force a liquidation, because
+        that is separate from pausing new entries.
+        """
+        self._rollover_daily_loss_guard(equity_usdt)
+        if self.daily_trading_halted or not self.daily_equity_baseline_usdt:
+            return
+        daily_return_pct = (
+            equity_usdt - self.daily_equity_baseline_usdt
+        ) / self.daily_equity_baseline_usdt
+        if daily_return_pct <= -self.daily_loss_limit_pct:
+            self.daily_trading_halted = True
+            logger.error(
+                "DAILY LOSS LIMIT HIT | equity=%.2f USDT | daily pnl=%+.2f%% | "
+                "limit=-%.2f%% | new entries paused until tomorrow",
+                equity_usdt,
+                daily_return_pct * 100,
+                self.daily_loss_limit_pct * 100,
+            )
 
     def _get_affordable_buy_amount(self, requested_usdt_amount):
         if requested_usdt_amount <= 0:
@@ -143,8 +189,8 @@ class PortfolioAgent:
         }
 
     def _update_profit_lock(self, position, pnl_pct):
-        # Each position can use its own profile, but all profiles implement a
-        # drawdown-based lock rather than selling immediately at the trigger.
+        # Each position can use its own profile. Once it reaches the trigger,
+        # it has a fixed absolute profit floor rather than a peak drawdown.
         profit_lock_start_pct = position.get(
             "profit_lock_start_pct",
             self.default_profit_lock_start_pct,
@@ -153,17 +199,10 @@ class PortfolioAgent:
             "profit_lock_floor_pct",
             self.default_profit_lock_floor_pct,
         )
-        profit_lock_drawdown_pct = position.get(
-            "profit_lock_drawdown_pct",
-            self.default_profit_lock_drawdown_pct,
-        )
         if pnl_pct < profit_lock_start_pct:
             return
 
-        new_lock_pct = max(
-            profit_lock_floor_pct,
-            pnl_pct - profit_lock_drawdown_pct,
-        )
+        new_lock_pct = profit_lock_floor_pct
         current_lock_pct = position["locked_profit_pct"] or 0.0
 
         if new_lock_pct > current_lock_pct:
@@ -228,9 +267,8 @@ class PortfolioAgent:
         position_lock_rule_label = (
             lock_rule_label
             or (
-                f"{position_lock_start_pct * 100:.0f}% trigger / "
-                f"{position_lock_drawdown_pct * 100:.0f}% trail / "
-                f"{position_lock_floor_pct * 100:.0f}% floor"
+                f"{position_lock_start_pct * 100:.0f}% net trigger / "
+                f"{position_lock_floor_pct * 100:.0f}% net floor"
             )
         )
 
@@ -502,6 +540,25 @@ class PortfolioAgent:
         monitor. That prevents frequent rescans from causing churn.
         """
         opened = []
+        requested_amounts = {
+            allocation["symbol"]: allocation["amount_usdt"]
+            for allocation in desired_allocations
+        }
+
+        # When the portfolio is empty, scale the complete approved basket to
+        # all usable cash. This reinvests realised gains while preserving the
+        # configured 100% or 70/30 allocation split.
+        if not self.positions and self._capital_tracking_enabled():
+            planned_total = sum(requested_amounts.values())
+            fee_rate = self.binance.paper_trading_fee_rate if self.paper_trading else 0.0
+            usable_gross_cash = self.available_usdt / (1 + fee_rate)
+            if planned_total > 0:
+                scale = usable_gross_cash / planned_total
+                requested_amounts = {
+                    symbol: amount * scale
+                    for symbol, amount in requested_amounts.items()
+                }
+
         for allocation in desired_allocations:
             if len(self.positions) >= self.max_open_positions:
                 break
@@ -510,15 +567,41 @@ class PortfolioAgent:
             if not self.has_investable_capital():
                 break
 
-            position = self.buy_position(
+            requested_amount = requested_amounts[allocation["symbol"]]
+            # With an existing holding, a newly freed slot uses all remaining
+            # usable cash rather than leaving realised proceeds idle.
+            if self.positions and self._capital_tracking_enabled():
+                requested_amount = max(
+                    requested_amount,
+                    self._get_affordable_buy_amount(self.available_usdt),
+                )
+
+            logger.info(
+                "EXECUTION PLAN | rank=%s | symbol=%s | amount=%.2f USDT",
+                allocation.get("allocation_rank", "fallback"),
                 allocation["symbol"],
-                allocation["amount_usdt"],
-                profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
-                profit_lock_floor_pct=allocation.get("profit_lock_floor_pct"),
-                profit_lock_drawdown_pct=allocation.get("profit_lock_drawdown_pct"),
-                lock_rule_label=allocation.get("lock_rule_label"),
+                requested_amount,
             )
+            try:
+                position = self.buy_position(
+                    allocation["symbol"],
+                    requested_amount,
+                    profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
+                    profit_lock_floor_pct=allocation.get("profit_lock_floor_pct"),
+                    profit_lock_drawdown_pct=allocation.get("profit_lock_drawdown_pct"),
+                    lock_rule_label=allocation.get("lock_rule_label"),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "EXECUTION REJECTED | symbol=%s | amount=%.2f USDT | reason=%s",
+                    allocation["symbol"],
+                    requested_amount,
+                    exc,
+                )
+                continue
             if position is not None:
+                if position["symbol"] != allocation["symbol"]:
+                    raise RuntimeError("Execution symbol does not match approved allocation")
                 opened.append(position)
         return opened
 
@@ -835,6 +918,7 @@ class PortfolioAgent:
             )
 
         portfolio_summary = self._get_portfolio_summary()
+        self._evaluate_daily_loss_guard(portfolio_summary["equity_usdt"])
         if self.starting_capital_usdt is not None:
             portfolio_net_pnl_usdt = (
                 portfolio_summary["equity_usdt"] - self.starting_capital_usdt
