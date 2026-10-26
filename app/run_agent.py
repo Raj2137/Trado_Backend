@@ -63,7 +63,7 @@ def log_selected_coins(coins):
 
 def scan_and_allocate(selector, decision_agent):
     # Run a fresh market scan and compute the best portfolio split for it.
-    coins = selector.get_top_coins(limit=10)
+    coins = selector.get_top_coins(limit=settings.MAX_OPEN_POSITIONS)
     if not coins:
         logger.warning("No qualified coins found in this scan")
         return [], None
@@ -77,7 +77,7 @@ def scan_and_allocate(selector, decision_agent):
 
     logger.info(
         "Decision-agent allocation: %s | est avg=%+.2f%% | "
-        "est total=%+.2f%% | est win=%.0f%% | deployed=$%.2f | cash reserve=$%.2f",
+        "est total=%+.2f%% | est win=%.0f%% | deployed=$%.2f | idle cash=$%.2f",
         recommended["name"],
         recommended["portfolio_avg_return"] * 100,
         recommended["portfolio_total_return"] * 100,
@@ -143,8 +143,8 @@ def main():
     while True:
         try:
             coins, recommended = scan_and_allocate(selector, decision_agent)
-        except Exception:
-            logger.exception("Initial market scan failed; retrying in 60 seconds")
+        except Exception as exc:
+            logger.warning("Initial market scan failed: %s; retrying in 60 seconds", exc)
             time.sleep(60)
             continue
 
@@ -196,8 +196,10 @@ def main():
             if scan_future is not None and scan_future.done():
                 try:
                     coins, scanned_recommendation = scan_future.result()
-                except Exception:
-                    logger.exception("Market rescan failed; keeping the previous basket")
+                except Exception as exc:
+                    logger.warning(
+                        "Market rescan failed: %s; keeping the previous basket", exc
+                    )
                 else:
                     if scanned_recommendation:
                         try:

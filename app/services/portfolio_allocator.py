@@ -1,8 +1,7 @@
 class PortfolioAllocator:
     # Explicit deployment rules for concentrated baskets with only a few names.
     SINGLE_COIN_WEIGHTS = [1.0]        # 100%
-    TWO_COIN_WEIGHTS = [0.5, 0.5]      # 50-50
-    THREE_COIN_WEIGHTS = [0.4, 0.3, 0.3]  # keep same
+    TWO_COIN_WEIGHTS = [0.7, 0.3]      # strongest candidate gets 70%
 
     @classmethod
     def _normalize_weights(cls, weights):
@@ -13,14 +12,16 @@ class PortfolioAllocator:
 
     @classmethod
     def _rank_for_allocation(cls, coins):
-        # Allocation order is based on historical behavior, not the live scan rank.
+        # Use the selector's combined live-plus-backtest score as the primary
+        # order. Backtest metrics remain tie-breakers rather than overriding
+        # the current liquid-market signal.
         return sorted(
             coins,
             key=lambda coin: (
+                coin.get("score", 0.0),
                 coin.get("backtest_score", 0.0),
                 coin.get("backtest_avg_return", 0.0),
                 coin.get("backtest_win_rate", 0.0),
-                coin.get("score", 0.0),
             ),
             reverse=True,
         )
@@ -32,18 +33,7 @@ class PortfolioAllocator:
             return cls.SINGLE_COIN_WEIGHTS
         if coin_count == 2:
             return cls.TWO_COIN_WEIGHTS
-        if coin_count == 3:
-            return cls.THREE_COIN_WEIGHTS
-
-        # For broader baskets, distribute the full book according to each
-        # coin's backtest strength instead of using a static profile.
-        backtest_strengths = [
-            max(coin.get("backtest_score", 0.0), 0.0)
-            for coin in allocation_order
-        ]
-        if sum(backtest_strengths) <= 0:
-            backtest_strengths = [1.0 for _ in allocation_order]
-        return cls._normalize_weights(backtest_strengths)
+        raise ValueError("Portfolio policy supports at most two positions")
 
     @classmethod
     def _build_allocation(cls, coin, weight, rank, total_capital, deployment_ratio):
@@ -57,10 +47,10 @@ class PortfolioAllocator:
             "backtest_win_rate": coin.get("backtest_win_rate", 0.0),
             "backtest_score": coin.get("backtest_score", 0.0),
             "profit_lock_start_pct": coin.get("profit_lock_start_pct", 0.02),
-            "profit_lock_floor_pct": coin.get("profit_lock_floor_pct", 0.01),
-            "profit_lock_drawdown_pct": coin.get("profit_lock_drawdown_pct", 0.02),
+            "profit_lock_floor_pct": coin.get("profit_lock_floor_pct", 0.02),
+            "profit_lock_drawdown_pct": coin.get("profit_lock_drawdown_pct", 0.0),
             "lock_rule_label": coin.get(
-                "lock_rule_label", "2% trigger / 2% trail / 1% floor"
+                "lock_rule_label", "2% net trigger / 2% net floor"
             ),
         }
 
@@ -76,17 +66,12 @@ class PortfolioAllocator:
         if not coins:
             return None, []
 
-        # The decision agent receives the top-ten ranked coins, but opens a
-        # concentrated basket. This avoids spreading a small account across
-        # too many minimum-size orders.
+        # Open only the top two fully-qualified coins. One candidate receives
+        # the full portfolio; two candidates receive a 70/30 split.
         ranked_coins = cls._rank_for_allocation(coins)
         allocation_order = ranked_coins[:max_positions]
         raw_weights = cls._get_raw_weights(allocation_order)
-        normalized_weights = (
-            raw_weights
-            if len(allocation_order) <= 3
-            else cls._normalize_weights(raw_weights)
-        )
+        normalized_weights = raw_weights
         if not normalized_weights:
             return None, allocation_order
 
@@ -122,9 +107,8 @@ class PortfolioAllocator:
         if not allocations:
             return None, allocation_order
 
-        # Keep the rest of the top-ten ranked coins as replacement candidates.
-        # A replacement uses an equal-sized slot, rather than deploying the
-        # entire remaining cash balance into one new name.
+        # Only candidates that pass the same selection gate may replace a
+        # closed position. The live agent will spend available cash on them.
         fallback_weight = 1 / max_positions
         fallback_allocations = [
             cls._build_allocation(
@@ -138,7 +122,7 @@ class PortfolioAllocator:
         ]
 
         recommended_profile = {
-            "name": "risk_reserved_backtest_weighted",
+            "name": "fully_deployed_top_two",
             "weights": [weight * 100 for weight in normalized_weights],
             "allocations": allocations,
             "fallback_allocations": fallback_allocations,
@@ -166,7 +150,10 @@ class PortfolioAllocator:
         if max_positions < 1:
             raise ValueError("max_positions must be at least 1")
 
-        # Use a small, risk-reserved basket selected from the top candidates.
+        if max_positions > 2:
+            raise ValueError("Portfolio policy supports at most two positions")
+
+        # Use a fully deployed one- or two-coin basket.
         recommended_profile, allocation_order = cls._build_recommended_profile(
             coins,
             total_capital,

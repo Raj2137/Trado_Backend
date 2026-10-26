@@ -3,6 +3,8 @@ import time
 
 import ccxt
 
+from app.core.config import settings
+
 # Use a module logger so selection decisions can be traced in logs.
 logger = logging.getLogger(__name__)
 
@@ -11,9 +13,9 @@ class CoinSelector:
     LOCK_PROFILE_OPTIONS = (
         {
             "profit_lock_start_pct": 0.02,
-            "profit_lock_floor_pct": 0.01,
-            "profit_lock_drawdown_pct": 0.02,
-            "lock_rule_label": "2% trigger / 2% trail / 1% floor",
+            "profit_lock_floor_pct": 0.02,
+            "profit_lock_drawdown_pct": 0.0,
+            "lock_rule_label": "2% net trigger / 2% net floor",
         },
     )
 
@@ -73,9 +75,8 @@ class CoinSelector:
         self.BACKTEST_LOOKBACK = 12
         self.BACKTEST_FORWARD_WINDOW = 6
         self.BACKTEST_STEP_HOURS = 2
-        # Backtest is used to rank and choose the profit-lock rule, not to
-        # disqualify otherwise valid scan candidates.
-        self.MIN_BACKTEST_TRADES = 0
+        # A very small sample is not reliable enough to fund a new position.
+        self.MIN_BACKTEST_TRADES = settings.MIN_BACKTEST_TRADES
         self.STOP_LOSS_PCT = -0.02
 
         # Only deeply inspect the most liquid names to keep the scan focused.
@@ -220,8 +221,11 @@ class CoinSelector:
                 "score": 0.0,
             }
 
-        returns = [trade["return"] for trade in trades]
-        winning_trades = [trade for trade in trades if trade["return"] > 0]
+        # A live round trip has a buy and sell fee. Deduct both here so the
+        # selection gate does not call a small gross gain an "edge".
+        round_trip_fee_rate = settings.PAPER_TRADING_FEE_RATE * 2
+        returns = [trade["return"] - round_trip_fee_rate for trade in trades]
+        winning_trades = [trade for trade in trades if trade["return"] - round_trip_fee_rate > 0]
         lock_exits = [trade for trade in trades if trade["exit_reason"] == "profit_lock"]
         avg_return = sum(returns) / len(returns)
         total_return = sum(returns)
@@ -271,10 +275,10 @@ class CoinSelector:
         profit_lock_floor_pct,
         profit_lock_drawdown_pct,
     ):
-        # This approximates the live trailing logic using hourly candles:
-        # Stop out at -2%. Once a trade reaches +2%, protect at least +1%
-        # and then exit after a 2 percentage-point retracement from the best
-        # net profit seen. This mirrors the live position-management rule.
+        # This approximates the live fixed-profit-floor rule using hourly
+        # candles: stop out at -2%; after reaching +2%, exit if profit falls
+        # below the fixed +2% floor. It intentionally does not trail a
+        # percentage below a later peak.
         highest_profit = None
 
         for hours_held, candle in enumerate(future_candles, start=1):
@@ -289,10 +293,7 @@ class CoinSelector:
                 highest_profit = max(highest_profit or 0.0, high_profit)
 
             if highest_profit is not None:
-                locked_profit = max(
-                    profit_lock_floor_pct,
-                    highest_profit - profit_lock_drawdown_pct,
-                )
+                locked_profit = profit_lock_floor_pct
                 lock_price = entry_price * (1 + locked_profit)
                 if low_price <= lock_price:
                     return locked_profit, "profit_lock", hours_held
@@ -364,6 +365,23 @@ class CoinSelector:
 
             raise Exception("Failed to load markets after retries")
 
+    def safe_fetch_tickers(self, retries=3, retry_delay_seconds=2):
+        """Retry a full-market ticker request after transient Binance resets."""
+        for attempt in range(1, retries + 1):
+            try:
+                return self.exchange.fetch_tickers()
+            except Exception as exc:
+                if attempt == retries:
+                    raise
+                logger.warning(
+                    "Ticker download failed (attempt %s/%s): %s; retrying in %ss",
+                    attempt,
+                    retries,
+                    exc,
+                    retry_delay_seconds,
+                )
+                time.sleep(retry_delay_seconds)
+
     def get_top_coins(self, limit=10):
         # Load market metadata once so symbol-level checks are cheap.
         logger.info("Loading markets...")
@@ -373,7 +391,7 @@ class CoinSelector:
 
         # Pull all ticker snapshots so we can prefilter by live liquidity.
         logger.info("Fetching tickers...")
-        tickers = self.exchange.fetch_tickers()
+        tickers = self.safe_fetch_tickers()
 
         # Keep only symbols that pass the hard tradability filters.
         symbols = [
@@ -618,32 +636,21 @@ class CoinSelector:
         for candidate in selector_shortlist:
             backtest_ohlcv = candidate.pop("backtest_ohlcv")
 
-            # Run a recent historical simulation (backtest) on this coin to:
-            # 1. Validate that the strategy is actually profitable on this asset
-            # 2. Filter out coins that show weak or negative performance
-            # 3. Determine the best profit-lock configuration for this coin
-            #
-            # NOTE:
-            # Earlier, backtesting was only used for ranking, which allowed
-            # unprofitable coins (e.g., negative avg return, low win rate)
-            # to still be selected based purely on momentum.
-            #
-            # Now, backtest acts as a quality gate BEFORE ranking.
-            # Only coins with acceptable historical performance are allowed through.
+            # Backtest recent behavior to select the profit-lock profile and
+            # validate that the live signal had a positive, fee-adjusted edge.
             backtest = self._backtest_strategy(backtest_ohlcv)
 
-            # Filter out weak / unprofitable candidates early
-            # This prevents capital allocation to coins that historically
-            # do not respond well to the strategy.
-            if backtest["score"] < 0.3:
-                continue
-
-
-            # Combine live momentum and historical strategy behavior into
-            # one final ranking score without changing shortlist membership.
+            # Use backtest evidence proportionally. A candidate with no valid
+            # simulated entries retains its live score instead of receiving a
+            # misleading zero; once three trades exist, backtest gets its full
+            # 30% ranking weight.
+            backtest_weight = 0.30 * min(
+                backtest["trades"] / self.MIN_BACKTEST_TRADES,
+                1.0,
+            )
             score = (
-                candidate["selector_score"] * 0.70 +
-                backtest["score"] * 0.30
+                candidate["selector_score"] * (1 - backtest_weight) +
+                backtest["score"] * backtest_weight
             )
 
             candidate["score"] = score
@@ -654,10 +661,27 @@ class CoinSelector:
             candidate["backtest_profit_lock_rate"] = backtest["profit_lock_rate"]
             candidate["backtest_avg_hours_held"] = backtest["avg_hours_held"]
             candidate["backtest_score"] = backtest["score"]
+            candidate["backtest_weight"] = backtest_weight
             candidate["profit_lock_start_pct"] = backtest["profit_lock_start_pct"]
             candidate["profit_lock_floor_pct"] = backtest["profit_lock_floor_pct"]
             candidate["profit_lock_drawdown_pct"] = backtest["profit_lock_drawdown_pct"]
             candidate["lock_rule_label"] = backtest["lock_rule_label"]
+
+            if backtest["trades"] < settings.MIN_BACKTEST_TRADES:
+                logger.info(
+                    "Rejecting %s | only %s backtest trades (minimum %s)",
+                    candidate["symbol"],
+                    backtest["trades"],
+                    settings.MIN_BACKTEST_TRADES,
+                )
+                continue
+            if backtest["avg_return"] <= settings.MIN_BACKTEST_NET_AVG_RETURN:
+                logger.info(
+                    "Rejecting %s | fee-adjusted backtest avg=%+.2f%% is not positive",
+                    candidate["symbol"],
+                    backtest["avg_return"] * 100,
+                )
+                continue
 
             # These were only needed to build the final score.
             candidate.pop("momentum_score")

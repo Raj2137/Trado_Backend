@@ -20,7 +20,7 @@ class PortfolioDecisionAgent:
         self.llm_advisory = None
 
     def recommend(self, ranked_coins):
-        """Turn the top-ten selector output into a risk-reserved basket."""
+        """Turn the qualified top-two selector output into a full basket."""
         return PortfolioAllocator.allocate(
             ranked_coins,
             total_capital=self.total_capital_usdt,
@@ -53,34 +53,33 @@ class PortfolioDecisionAgent:
         return None
 
     def _prioritized_allocations(self, recommendation):
-        """Bound the LLM to a small rank adjustment; it cannot set sizing."""
-        allocations = (
-            recommendation["allocations"]
-            + recommendation.get("fallback_allocations", [])
+        """Keep approved primary allocations ahead of replacements.
+
+        The LLM can block a high-confidence ``avoid`` entry, but it cannot
+        silently promote a fallback candidate above an approved allocation.
+        This makes the execution log directly auditable against the plan.
+        """
+        def eligible_allocations(allocations):
+            eligible = []
+            for allocation in allocations:
+                advice = self._advisory_for(allocation["symbol"])
+                confidence = advice.get("confidence", 0.0) if advice else 0.0
+                action = advice.get("action", "neutral") if advice else "neutral"
+
+                if action == "avoid" and confidence >= settings.LLM_MIN_CONFIDENCE:
+                    logger.info(
+                        "LLM advisory blocks new entry for %s", allocation["symbol"]
+                    )
+                    continue
+                eligible.append(allocation)
+            return eligible
+
+        # Preserve the deterministic allocation order. Fallbacks are used only
+        # if a primary position could not be opened or later leaves a slot.
+        return (
+            eligible_allocations(recommendation["allocations"])
+            + eligible_allocations(recommendation.get("fallback_allocations", []))
         )
-        eligible = []
-        for allocation in allocations:
-            advice = self._advisory_for(allocation["symbol"])
-            confidence = advice.get("confidence", 0.0) if advice else 0.0
-            action = advice.get("action", "neutral") if advice else "neutral"
-
-            # A high-confidence avoid blocks only a new entry. It does not
-            # itself cause an immediate sale of an existing healthy position.
-            if action == "avoid" and confidence >= settings.LLM_MIN_CONFIDENCE:
-                continue
-
-            adjustment = 0.0
-            if action == "boost":
-                adjustment = settings.LLM_MAX_RANK_ADJUSTMENT * confidence
-            elif action == "avoid":
-                adjustment = -settings.LLM_MAX_RANK_ADJUSTMENT * confidence
-
-            eligible.append((
-                allocation.get("backtest_score", 0.0) + adjustment,
-                allocation,
-            ))
-
-        return [allocation for _, allocation in sorted(eligible, reverse=True, key=lambda item: item[0])]
 
     def _close_llm_confirmed_weak_positions(self, execution_agent):
         """Allow an LLM warning only when deterministic weakness confirms it."""
@@ -109,6 +108,9 @@ class PortfolioDecisionAgent:
     def run_minute(self, execution_agent, recommendation):
         """Apply hard rules, then fill slots with bounded research input."""
         if not recommendation:
+            return []
+        if execution_agent.is_daily_trading_halted():
+            logger.warning("New entries disabled by the daily-loss circuit breaker")
             return []
         self._close_llm_confirmed_weak_positions(execution_agent)
         return execution_agent.refill_from_recommendations(

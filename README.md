@@ -6,19 +6,29 @@ This repo can run as a long-lived paper-trading worker.
 
 - The selector ranks the top 10 qualifying USDT spot pairs using seven days
   of hourly data, and backtests the same seven-day window.
-- The decision agent opens at most 3 positions and initially deploys 75% of
-  configured capital. The remaining 25% is held as a cash reserve.
-- Positions are checked every 60 seconds. A position exits at a 2% net loss.
-- Once a position reaches +2%, it protects at least +1% profit and exits if
-  its net profit drops 2 percentage points from its best observed profit.
+- The decision agent considers only the top two qualified coins. One coin
+  receives 100% of available capital; two coins receive a 70% / 30% split.
+  Only exchange-fee dust remains idle.
+- Positions are checked every minute for stop-loss and profit-lock exits. A
+  position exits at a 2% net loss.
+- Once a position reaches +2% net profit, it holds a fixed +2% net-profit
+  floor and exits on the next monitoring check below it. A sold coin has a
+  15-minute cooldown, then can re-enter only if it still qualifies in a fresh
+  scan.
 - Market scans run independently from the monitoring loop, so slow candle
   downloads do not delay the one-minute exit checks.
+- The market ranking refreshes every 15 minutes. A coin needs at least three
+  recent simulated entries and a positive average return after estimated
+  round-trip fees; otherwise the worker holds cash rather than forcing a trade.
+- A 30% loss from the day's opening equity pauses new entries until the next
+  calendar day. Existing positions continue to be monitored by their normal
+  stop-loss and profit-lock rules.
 
 All values are configurable in `.env`; start with `.env.example`.
 
 ## Optional LLM research adviser
 
-The optional adviser runs every ten minutes, receives the top-10 metrics plus
+The optional adviser runs every 15 minutes, receives the top-10 metrics plus
 current portfolio state, and can use web research to return a structured market
 summary and `boost` / `neutral` / `avoid` views. It has no Binance credentials,
 cannot submit orders, cannot change stop-loss/profit-lock rules, and is disabled
