@@ -1,4 +1,5 @@
 import logging
+import time
 
 import ccxt
 
@@ -9,14 +10,10 @@ logger = logging.getLogger(__name__)
 class CoinSelector:
     LOCK_PROFILE_OPTIONS = (
         {
-            "profit_lock_start_pct": 0.01,
-            "profit_lock_step_pct": 0.01,
-            "lock_rule_label": "1%",
-        },
-        {
             "profit_lock_start_pct": 0.02,
-            "profit_lock_step_pct": 0.01,
-            "lock_rule_label": "2%",
+            "profit_lock_floor_pct": 0.01,
+            "profit_lock_drawdown_pct": 0.02,
+            "lock_rule_label": "2% trigger / 2% trail / 1% floor",
         },
     )
 
@@ -62,16 +59,17 @@ class CoinSelector:
         self.MIN_6H_MOMENTUM = 0.003   # 0.2%
         self.MIN_24H_MOMENTUM = 0.009   # 1.5%
 
-        # Fetch a deeper history so the selector can screen for legitimate,
-        # established names before running the recent rank/backtest passes.
-        self.HISTORY_LIMIT = 336
-        self.RANKING_WINDOW_HOURS = 24
-        self.BACKTEST_WINDOW_HOURS = 48
-        self.LEGITIMACY_WINDOW_HOURS = 24 * 14
+        # Selection and the rolling simulation both use the latest complete
+        # seven days of hourly candles. This replaces the previous 48-hour
+        # backtest, which was too small to be meaningful.
+        self.HISTORY_LIMIT = 24 * 7
+        self.RANKING_WINDOW_HOURS = 24 * 7
+        self.BACKTEST_WINDOW_HOURS = 24 * 7
+        self.LEGITIMACY_WINDOW_HOURS = 24 * 7
         self.WEEKLY_VOLUME_WINDOW_HOURS = 24 * 7
 
-        # The backtest now uses a 48-hour window, which gives the rolling
-        # simulation more entry opportunities while keeping it recent.
+        # A seven-day window gives the rolling simulation more entry
+        # opportunities while still keeping the selected market regime recent.
         self.BACKTEST_LOOKBACK = 12
         self.BACKTEST_FORWARD_WINDOW = 6
         self.BACKTEST_STEP_HOURS = 2
@@ -270,34 +268,31 @@ class CoinSelector:
         entry_price,
         future_candles,
         profit_lock_start_pct,
-        profit_lock_step_pct,
+        profit_lock_floor_pct,
+        profit_lock_drawdown_pct,
     ):
         # This approximates the live trailing logic using hourly candles:
-        # stop out at -2%, then ratchet the locked exit according to the
-        # lock profile being evaluated for that coin.
-        locked_profit = None
+        # Stop out at -2%. Once a trade reaches +2%, protect at least +1%
+        # and then exit after a 2 percentage-point retracement from the best
+        # net profit seen. This mirrors the live position-management rule.
+        highest_profit = None
 
         for hours_held, candle in enumerate(future_candles, start=1):
             high_price = candle[2]
             low_price = candle[3]
 
-            # When no profit lock exists yet, use the hard stop first as the
-            # conservative assumption for intrabar ordering.
-            if locked_profit is None and low_price <= entry_price * (1 + self.STOP_LOSS_PCT):
+            if highest_profit is None and low_price <= entry_price * (1 + self.STOP_LOSS_PCT):
                 return self.STOP_LOSS_PCT, "stop_loss", hours_held
 
             high_profit = (high_price - entry_price) / entry_price
             if high_profit >= profit_lock_start_pct:
-                lock_steps = int(
-                    (high_profit - profit_lock_start_pct) / profit_lock_step_pct
-                )
-                highest_lock = (
-                    profit_lock_start_pct
-                    + lock_steps * profit_lock_step_pct
-                )
-                locked_profit = max(locked_profit or 0.0, highest_lock)
+                highest_profit = max(highest_profit or 0.0, high_profit)
 
-            if locked_profit is not None:
+            if highest_profit is not None:
+                locked_profit = max(
+                    profit_lock_floor_pct,
+                    highest_profit - profit_lock_drawdown_pct,
+                )
                 lock_price = entry_price * (1 + locked_profit)
                 if low_price <= lock_price:
                     return locked_profit, "profit_lock", hours_held
@@ -332,7 +327,8 @@ class CoinSelector:
                     entry_price,
                     future_candles,
                     profit_lock_start_pct=lock_profile["profit_lock_start_pct"],
-                    profit_lock_step_pct=lock_profile["profit_lock_step_pct"],
+                    profit_lock_floor_pct=lock_profile["profit_lock_floor_pct"],
+                    profit_lock_drawdown_pct=lock_profile["profit_lock_drawdown_pct"],
                 )
                 trades.append({
                     "return": trade_return,
@@ -354,7 +350,8 @@ class CoinSelector:
             "avg_hours_held": 0.0,
             "score": 0.0,
             "profit_lock_start_pct": self.LOCK_PROFILE_OPTIONS[0]["profit_lock_start_pct"],
-            "profit_lock_step_pct": self.LOCK_PROFILE_OPTIONS[0]["profit_lock_step_pct"],
+            "profit_lock_floor_pct": self.LOCK_PROFILE_OPTIONS[0]["profit_lock_floor_pct"],
+            "profit_lock_drawdown_pct": self.LOCK_PROFILE_OPTIONS[0]["profit_lock_drawdown_pct"],
             "lock_rule_label": self.LOCK_PROFILE_OPTIONS[0]["lock_rule_label"],
         }
     def safe_load_markets(self, retries=3):
@@ -411,9 +408,8 @@ class CoinSelector:
                     limit=self.HISTORY_LIMIT
                 )
 
-                # Keep enough history for legitimacy checks, then reserve the
-                # latest 24h slice for ranking and the latest 48h slice for
-                # backtesting.
+                # Keep enough history for the seven-day ranking, legitimacy,
+                # and backtest passes.
                 if len(ohlcv) < max(
                     self.LEGITIMACY_WINDOW_HOURS,
                     self.BACKTEST_LOOKBACK + self.BACKTEST_FORWARD_WINDOW,
@@ -434,14 +430,15 @@ class CoinSelector:
                     continue
 
                 legitimacy_closes = [c[4] for c in legitimacy_ohlcv]
-                two_week_range = (
+                one_week_range = (
                     max(legitimacy_closes) - min(legitimacy_closes)
                 ) / min(legitimacy_closes)
-                if two_week_range > 1.20:
+                if one_week_range > 1.20:
                     continue
 
-                # Use the latest 24h for live ranking and a longer 48h slice
-                # for the recent backtest.
+                # Use the same latest seven-day range for live ranking and
+                # rolling backtesting. Short-horizon signals below still use
+                # the final 6h, 12h, and 24h within that range.
                 ranking_ohlcv = ohlcv[-self.RANKING_WINDOW_HOURS:]
                 backtest_ohlcv = ohlcv[-self.BACKTEST_WINDOW_HOURS:]
                 ranking_closes = [c[4] for c in ranking_ohlcv]
@@ -464,8 +461,7 @@ class CoinSelector:
                 if bid and ask and bid > 0 and ask > 0:
                     spread_pct = (ask - bid) / bid
 
-                # Use only the latest 24 hours for live recommendation ranking.
-                notional_24h_usd = sum(ranking_notional)
+                notional_24h_usd = sum(ranking_notional[-24:])
                 liquidity_score = min(notional_24h_usd / 20_000_000, 1.0)
 
                 # Measure trend strength across short and medium horizons.
@@ -476,7 +472,7 @@ class CoinSelector:
                     (ranking_closes[-1] - ranking_closes[-13]) / ranking_closes[-13]
                 )
                 momentum_24h = (
-                    (ranking_closes[-1] - ranking_closes[0]) / ranking_closes[0]
+                    (ranking_closes[-1] - ranking_closes[-25]) / ranking_closes[-25]
                 )
 
                 # Use weighted momentum so recent strength matters most.
@@ -527,7 +523,7 @@ class CoinSelector:
                 volume_score = self._clamp(volume_spike / 2.5)
 
                 # Check whether price is near a recent breakout zone.
-                previous_24h_high = max(ranking_closes[:-1])
+                previous_24h_high = max(ranking_closes[-25:-1])
                 breakout = current_price >= previous_24h_high * 0.995
                 breakout_score = 1.0 if breakout else 0.0
 
@@ -585,7 +581,7 @@ class CoinSelector:
                     "spread_pct": spread_pct,
                     "listing_days": listing_days,
                     "weekly_volume_usd": weekly_notional_usd,
-                    "two_week_range": two_week_range,
+                    "one_week_range": one_week_range,
                     "trend_score": trend_score,
                     "momentum_score": momentum_score,
                     "acceleration_score": acceleration_score,
@@ -659,7 +655,8 @@ class CoinSelector:
             candidate["backtest_avg_hours_held"] = backtest["avg_hours_held"]
             candidate["backtest_score"] = backtest["score"]
             candidate["profit_lock_start_pct"] = backtest["profit_lock_start_pct"]
-            candidate["profit_lock_step_pct"] = backtest["profit_lock_step_pct"]
+            candidate["profit_lock_floor_pct"] = backtest["profit_lock_floor_pct"]
+            candidate["profit_lock_drawdown_pct"] = backtest["profit_lock_drawdown_pct"]
             candidate["lock_rule_label"] = backtest["lock_rule_label"]
 
             # These were only needed to build the final score.

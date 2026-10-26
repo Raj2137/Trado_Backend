@@ -1,0 +1,7 @@
+services:
+  trading-agent:
+    build: .
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: python -m app.run_agent --trade-mode paper
