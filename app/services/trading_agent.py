@@ -1,6 +1,7 @@
 import logging
 import time
 
+from app.core.config import settings
 from app.services.binance_service import BinanceService
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,11 @@ class PortfolioAgent:
         )
         self.available_usdt = self.starting_capital_usdt
         self.capital_epsilon_usdt = 1e-8
+        self.capital_reserve_usdt = (
+            0.0
+            if self.starting_capital_usdt is None
+            else self.starting_capital_usdt * (1 - settings.INITIAL_DEPLOYMENT_RATIO)
+        )
         # Use one Binance service for the whole portfolio run.
         self.binance = BinanceService(paper_trading=paper_trading)
         self.paper_trading = self.binance.paper_trading
@@ -32,18 +38,24 @@ class PortfolioAgent:
         # Poll open positions once per minute by default.
         self.monitor_interval_seconds = monitor_interval_seconds
 
-        # Exit any trade that falls 2% below entry.
-        self.stop_loss_pct = -0.015        # -1.5%
+        # Exit a losing trade at -2% net PnL.
+        self.stop_loss_pct = -settings.STOP_LOSS_PCT
         self.weak_position_exit_pct = -0.01  # -1%
-        self.recommendation_exit_top_n = 4
+        self.recommendation_exit_top_n = 10
 
-        # Default trailing lock configuration when no coin-specific rule exists.
-        self.default_profit_lock_start_pct = 0.015  # 1.5%
-        self.default_profit_lock_step_pct = 0.01
+        # At +2%, protect at least +1%. Thereafter, exit after a 2 percentage
+        # point drawdown from the highest net PnL reached by the position.
+        self.default_profit_lock_start_pct = settings.PROFIT_LOCK_START_PCT
+        self.default_profit_lock_floor_pct = settings.PROFIT_LOCK_FLOOR_PCT
+        self.default_profit_lock_drawdown_pct = settings.PROFIT_LOCK_DRAWDOWN_PCT
+        self.max_open_positions = settings.MAX_OPEN_POSITIONS
+        self.min_trade_size_usdt = settings.MIN_TRADE_SIZE_USDT
+        self.reentry_cooldown_seconds = settings.REENTRY_COOLDOWN_SECONDS
 
         # Track all live positions keyed by symbol.
         self.positions = {}
         self.latest_recommended_symbols = set()
+        self.reentry_not_before = {}
 
     def has_open_positions(self):
         # Let the caller know whether there is anything left to manage.
@@ -60,7 +72,15 @@ class PortfolioAgent:
     def has_trading_capital(self):
         if not self._capital_tracking_enabled():
             return True
-        return self.available_usdt > self.capital_epsilon_usdt
+        return self.available_usdt > self.capital_reserve_usdt + self.capital_epsilon_usdt
+
+    def has_investable_capital(self):
+        if not self._capital_tracking_enabled():
+            return True
+        return (
+            self.available_usdt - self.capital_reserve_usdt
+            >= self.min_trade_size_usdt
+        )
 
     def _get_affordable_buy_amount(self, requested_usdt_amount):
         if requested_usdt_amount <= 0:
@@ -69,14 +89,15 @@ class PortfolioAgent:
         if not self._capital_tracking_enabled():
             return requested_usdt_amount
 
-        if self.available_usdt <= self.capital_epsilon_usdt:
+        spendable_usdt = self.available_usdt - self.capital_reserve_usdt
+        if spendable_usdt <= self.capital_epsilon_usdt:
             return 0.0
 
         if self.paper_trading:
             fee_rate = self.binance.paper_trading_fee_rate
-            max_gross_affordable = self.available_usdt / (1 + fee_rate)
+            max_gross_affordable = spendable_usdt / (1 + fee_rate)
         else:
-            max_gross_affordable = self.available_usdt
+            max_gross_affordable = spendable_usdt
 
         return min(requested_usdt_amount, max_gross_affordable)
 
@@ -99,7 +120,8 @@ class PortfolioAgent:
         entry_price,
         quantity,
         profit_lock_start_pct,
-        profit_lock_step_pct,
+        profit_lock_floor_pct,
+        profit_lock_drawdown_pct,
         lock_rule_label,
         # entry_time
     ):
@@ -114,26 +136,34 @@ class PortfolioAgent:
             "highest_pnl_pct": 0.0,
             "locked_profit_pct": None,
             "profit_lock_start_pct": profit_lock_start_pct,
-            "profit_lock_step_pct": profit_lock_step_pct,
+            "profit_lock_floor_pct": profit_lock_floor_pct,
+            "profit_lock_drawdown_pct": profit_lock_drawdown_pct,
             "lock_rule_label": lock_rule_label,
             # "entry_time": time.time(),
         }
 
     def _update_profit_lock(self, position, pnl_pct):
-        # Each position can use the lock profile that backtested best for it.
+        # Each position can use its own profile, but all profiles implement a
+        # drawdown-based lock rather than selling immediately at the trigger.
         profit_lock_start_pct = position.get(
             "profit_lock_start_pct",
             self.default_profit_lock_start_pct,
         )
-        profit_lock_step_pct = position.get(
-            "profit_lock_step_pct",
-            self.default_profit_lock_step_pct,
+        profit_lock_floor_pct = position.get(
+            "profit_lock_floor_pct",
+            self.default_profit_lock_floor_pct,
+        )
+        profit_lock_drawdown_pct = position.get(
+            "profit_lock_drawdown_pct",
+            self.default_profit_lock_drawdown_pct,
         )
         if pnl_pct < profit_lock_start_pct:
             return
 
-        lock_steps = int((pnl_pct - profit_lock_start_pct) / profit_lock_step_pct)
-        new_lock_pct = profit_lock_start_pct + (lock_steps * profit_lock_step_pct)
+        new_lock_pct = max(
+            profit_lock_floor_pct,
+            pnl_pct - profit_lock_drawdown_pct,
+        )
         current_lock_pct = position["locked_profit_pct"] or 0.0
 
         if new_lock_pct > current_lock_pct:
@@ -150,9 +180,13 @@ class PortfolioAgent:
         symbol,
         usdt_amount,
         profit_lock_start_pct=None,
-        profit_lock_step_pct=None,
+        profit_lock_floor_pct=None,
+        profit_lock_drawdown_pct=None,
         lock_rule_label=None,
     ):
+        if time.time() < self.reentry_not_before.get(symbol, 0):
+            logger.info("Skipping %s because its re-entry cooldown is active", symbol)
+            return None
         # Skip tiny allocations that are not worth sending to the exchange.
         affordable_usdt_amount = self._get_affordable_buy_amount(usdt_amount)
         if affordable_usdt_amount <= 0:
@@ -181,13 +215,23 @@ class PortfolioAgent:
             if profit_lock_start_pct is None
             else profit_lock_start_pct
         )
-        position_lock_step_pct = (
-            self.default_profit_lock_step_pct
-            if profit_lock_step_pct is None
-            else profit_lock_step_pct
+        position_lock_floor_pct = (
+            self.default_profit_lock_floor_pct
+            if profit_lock_floor_pct is None
+            else profit_lock_floor_pct
+        )
+        position_lock_drawdown_pct = (
+            self.default_profit_lock_drawdown_pct
+            if profit_lock_drawdown_pct is None
+            else profit_lock_drawdown_pct
         )
         position_lock_rule_label = (
-            lock_rule_label or f"{position_lock_start_pct * 100:.0f}%"
+            lock_rule_label
+            or (
+                f"{position_lock_start_pct * 100:.0f}% trigger / "
+                f"{position_lock_drawdown_pct * 100:.0f}% trail / "
+                f"{position_lock_floor_pct * 100:.0f}% floor"
+            )
         )
 
         position = self._build_position(
@@ -196,7 +240,8 @@ class PortfolioAgent:
             entry_price,
             filled_quantity,
             position_lock_start_pct,
-            position_lock_step_pct,
+            position_lock_floor_pct,
+            position_lock_drawdown_pct,
             position_lock_rule_label,
         )
         position["buy_fee_usdt"] = buy_fee_usdt
@@ -233,13 +278,16 @@ class PortfolioAgent:
         # Open all positions from the recommended portfolio split.
         opened_positions = []
         for allocation in allocations:
+            if len(self.positions) >= self.max_open_positions:
+                break
             if allocation["symbol"] in self.positions:
                 continue
             position = self.buy_position(
                 allocation["symbol"],
                 allocation["amount_usdt"],
                 profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
-                profit_lock_step_pct=allocation.get("profit_lock_step_pct"),
+                profit_lock_floor_pct=allocation.get("profit_lock_floor_pct"),
+                profit_lock_drawdown_pct=allocation.get("profit_lock_drawdown_pct"),
                 lock_rule_label=allocation.get("lock_rule_label"),
             )
             if position is not None:
@@ -425,6 +473,9 @@ class PortfolioAgent:
         )
 
         del self.positions[symbol]
+        self.reentry_not_before[symbol] = (
+            time.time() + self.reentry_cooldown_seconds
+        )
         self._increase_available_usdt(net_exit_value)
         self._record_closed_trade(symbol, pnl_usdt)
         self._log_realized_pnl_summary()
@@ -442,8 +493,35 @@ class PortfolioAgent:
             "pnl_usdt": pnl_usdt,
             "pnl_pct": pnl_pct,
         }
-    
-    
+
+    def refill_from_recommendations(self, desired_allocations):
+        """Use available cash to fill empty slots from the latest ranked basket.
+
+        This method deliberately does not sell a healthy holding. Sales are
+        governed by the stop-loss and trailing-profit rules in the one-minute
+        monitor. That prevents frequent rescans from causing churn.
+        """
+        opened = []
+        for allocation in desired_allocations:
+            if len(self.positions) >= self.max_open_positions:
+                break
+            if allocation["symbol"] in self.positions:
+                continue
+            if not self.has_investable_capital():
+                break
+
+            position = self.buy_position(
+                allocation["symbol"],
+                allocation["amount_usdt"],
+                profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
+                profit_lock_floor_pct=allocation.get("profit_lock_floor_pct"),
+                profit_lock_drawdown_pct=allocation.get("profit_lock_drawdown_pct"),
+                lock_rule_label=allocation.get("lock_rule_label"),
+            )
+            if position is not None:
+                opened.append(position)
+        return opened
+
     def partial_close_position(self, symbol, fraction, reason):
         """
         Sell a fraction of an existing position (0 < fraction <= 1)
@@ -534,7 +612,8 @@ class PortfolioAgent:
                 symbol,
                 allocation["amount_usdt"],
                 profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
-                profit_lock_step_pct=allocation.get("profit_lock_step_pct"),
+                profit_lock_floor_pct=allocation.get("profit_lock_floor_pct"),
+                profit_lock_drawdown_pct=allocation.get("profit_lock_drawdown_pct"),
                 lock_rule_label=allocation.get("lock_rule_label"),
             )
 
@@ -641,7 +720,8 @@ class PortfolioAgent:
                 new_symbol,
                 allocation["amount_usdt"],
                 profit_lock_start_pct=allocation.get("profit_lock_start_pct"),
-                profit_lock_step_pct=allocation.get("profit_lock_step_pct"),
+                profit_lock_floor_pct=allocation.get("profit_lock_floor_pct"),
+                profit_lock_drawdown_pct=allocation.get("profit_lock_drawdown_pct"),
                 lock_rule_label=allocation.get("lock_rule_label"),
             )
 

@@ -1,10 +1,12 @@
 import argparse
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from app.core.config import settings
 from app.services.coin_selector import CoinSelector
-from app.services.portfolio_allocator import PortfolioAllocator
+from app.services.decision_agent import PortfolioDecisionAgent
+from app.services.llm_research_agent import LLMResearchAgent
 from app.services.trading_agent import PortfolioAgent
 
 # Configure application-wide logging for the scan output.
@@ -16,9 +18,9 @@ logging.basicConfig(
 # Reuse a module logger so log messages are easy to trace.
 logger = logging.getLogger(__name__)
 
-TOTAL_CAPITAL = 100
-MONITOR_INTERVAL_SECONDS = 60
-SCAN_INTERVAL_SECONDS = 300
+TOTAL_CAPITAL = settings.TOTAL_CAPITAL_USDT
+MONITOR_INTERVAL_SECONDS = settings.MONITOR_INTERVAL_SECONDS
+SCAN_INTERVAL_SECONDS = settings.SCAN_INTERVAL_SECONDS
 
 
 def parse_args():
@@ -59,7 +61,7 @@ def log_selected_coins(coins):
         )
 
 
-def scan_and_allocate(selector):
+def scan_and_allocate(selector, decision_agent):
     # Run a fresh market scan and compute the best portfolio split for it.
     coins = selector.get_top_coins(limit=10)
     if not coins:
@@ -68,17 +70,13 @@ def scan_and_allocate(selector):
 
     log_selected_coins(coins)
 
-    allocation_analysis = PortfolioAllocator.allocate(
-        coins,
-        total_capital=TOTAL_CAPITAL,
-    )
-    recommended = allocation_analysis["recommended"] if allocation_analysis else None
+    recommended = decision_agent.recommend(coins)
     if not recommended:
         logger.warning("No allocation profile qualified for live execution")
         return coins, None
 
     logger.info(
-        "Recommended allocation profile: %s | est avg=%+.2f%% | "
+        "Decision-agent allocation: %s | est avg=%+.2f%% | "
         "est total=%+.2f%% | est win=%.0f%% | deployed=$%.2f | cash reserve=$%.2f",
         recommended["name"],
         recommended["portfolio_avg_return"] * 100,
@@ -103,6 +101,29 @@ def scan_and_allocate(selector):
     return coins, recommended
 
 
+def get_research_positions(agent):
+    """Build a small, current portfolio snapshot for the advisory prompt."""
+    snapshots = []
+    for symbol, position in agent.positions.items():
+        try:
+            snapshot = agent.get_position_snapshot(symbol)
+        except Exception:
+            logger.exception("Could not fetch %s for the LLM research snapshot", symbol)
+            continue
+        snapshots.append({
+            "symbol": symbol,
+            "entry_price": position["entry_price"],
+            "pnl_pct": round(snapshot["pnl_pct"] * 100, 3),
+            "highest_pnl_pct": round(position["highest_pnl_pct"] * 100, 3),
+            "locked_profit_pct": (
+                None
+                if position["locked_profit_pct"] is None
+                else round(position["locked_profit_pct"] * 100, 3)
+            ),
+        })
+    return snapshots
+
+
 def main():
    
     args = parse_args()
@@ -110,6 +131,8 @@ def main():
 
     # Build the selector service that knows how to scan Binance markets.
     selector = CoinSelector()
+    decision_agent = PortfolioDecisionAgent(total_capital_usdt=TOTAL_CAPITAL)
+    research_agent = LLMResearchAgent()
     agent = PortfolioAgent(
         monitor_interval_seconds=MONITOR_INTERVAL_SECONDS,
         paper_trading=paper_trading,
@@ -117,46 +140,112 @@ def main():
     )
     logger.info("Starting market scan in %s mode", args.trade_mode)
 
-    coins, recommended = scan_and_allocate(selector)
-    agent.update_latest_recommendations([coin["symbol"] for coin in coins])
-    if not recommended:
-        return
+    while True:
+        try:
+            coins, recommended = scan_and_allocate(selector, decision_agent)
+        except Exception:
+            logger.exception("Initial market scan failed; retrying in 60 seconds")
+            time.sleep(60)
+            continue
 
-    agent.buy_allocations(recommended["allocations"])
+        if recommended:
+            agent.update_latest_recommendations([coin["symbol"] for coin in coins])
+            break
+
+        logger.warning("No initial basket qualified; retrying in 60 seconds")
+        time.sleep(60)
+
+    try:
+        decision_agent.run_minute(agent, recommended)
+    except Exception:
+        logger.exception("Initial basket execution failed; the decision loop will retry")
     if not agent.has_open_positions() and not agent.has_trading_capital():
         logger.warning("Trading halted because no capital remains to invest")
         return
 
     next_monitor_at = time.time()
     next_scan_at = time.time() + SCAN_INTERVAL_SECONDS
-    while True:
-        if not agent.has_open_positions() and not agent.has_trading_capital():
-            logger.warning("Trading halted because no capital remains to invest")
-            break
+    next_research_at = time.time() if research_agent.enabled else None
+    scan_future = None
+    research_future = None
 
-        now = time.time()
+    # Scanning downloads many candle series. Keep it off the monitoring path
+    # so a slow API response cannot delay the one-minute risk checks.
+    with (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="market-scan") as scan_executor,
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="llm-research") as research_executor,
+    ):
+        while True:
+            if not agent.has_open_positions() and not agent.has_trading_capital():
+                logger.warning("Trading halted because no capital remains to invest")
+                break
 
-        if agent.has_open_positions() and now >= next_monitor_at:
-            agent.monitor_positions_once()
-            next_monitor_at = now + MONITOR_INTERVAL_SECONDS
+            now = time.time()
 
-        if now >= next_scan_at:
-            logger.info("Starting independent rescan for portfolio refill")
-            coins, recommended = scan_and_allocate(selector)
-            agent.update_latest_recommendations([coin["symbol"] for coin in coins])
-            next_scan_at = now + SCAN_INTERVAL_SECONDS
+            if now >= next_monitor_at:
+                try:
+                    if agent.has_open_positions():
+                        agent.monitor_positions_once()
+                    # This uses cached rankings and live position/cash state only.
+                    # It is intentionally fast and does not start a full scan.
+                    decision_agent.run_minute(agent, recommended)
+                except Exception:
+                    logger.exception("Monitoring tick failed; retrying next minute")
+                next_monitor_at = now + MONITOR_INTERVAL_SECONDS
 
-            if recommended:
-                if agent.has_open_positions():
-                    agent.rotate_positions(recommended["allocations"])
+            if scan_future is not None and scan_future.done():
+                try:
+                    coins, scanned_recommendation = scan_future.result()
+                except Exception:
+                    logger.exception("Market rescan failed; keeping the previous basket")
                 else:
-                    if not agent.has_trading_capital():
-                        logger.warning("Trading halted because no capital remains to invest")
-                        break
-                    logger.info("No open positions remain, opening the new recommended basket")
-                    agent.buy_allocations(recommended["allocations"])
+                    if scanned_recommendation:
+                        try:
+                            recommended = scanned_recommendation
+                            agent.update_latest_recommendations(
+                                [coin["symbol"] for coin in coins]
+                            )
+                            decision_agent.run_minute(agent, recommended)
+                        except Exception:
+                            logger.exception(
+                                "Could not apply the latest recommendation; "
+                                "keeping the current portfolio"
+                            )
+                finally:
+                    scan_future = None
 
-        time.sleep(1)
+            if research_future is not None and research_future.done():
+                try:
+                    advisory = research_future.result()
+                except Exception:
+                    logger.exception("LLM research task failed; keeping prior advisory")
+                else:
+                    if advisory:
+                        decision_agent.update_llm_advisory(advisory)
+                finally:
+                    research_future = None
+
+            if now >= next_scan_at and scan_future is None:
+                logger.info("Starting background market rescan for portfolio refill")
+                scan_future = scan_executor.submit(
+                    scan_and_allocate, selector, decision_agent
+                )
+                next_scan_at = now + SCAN_INTERVAL_SECONDS
+
+            if (
+                next_research_at is not None
+                and now >= next_research_at
+                and research_future is None
+            ):
+                logger.info("Starting ten-minute LLM market research")
+                research_future = research_executor.submit(
+                    research_agent.analyze,
+                    list(coins),
+                    get_research_positions(agent),
+                )
+                next_research_at = now + settings.LLM_ADVISOR_INTERVAL_SECONDS
+
+            time.sleep(1)
 
 
 if __name__ == "__main__":

@@ -46,11 +46,41 @@ class PortfolioAllocator:
         return cls._normalize_weights(backtest_strengths)
 
     @classmethod
-    def _build_recommended_profile(cls, coins, total_capital, min_trade_size):
+    def _build_allocation(cls, coin, weight, rank, total_capital, deployment_ratio):
+        return {
+            "symbol": coin["symbol"],
+            "allocation_pct": deployment_ratio * weight * 100,
+            "allocation_rank": rank,
+            "amount_usdt": total_capital * deployment_ratio * weight,
+            "backtest_avg_return": coin.get("backtest_avg_return", 0.0),
+            "backtest_total_return": coin.get("backtest_total_return", 0.0),
+            "backtest_win_rate": coin.get("backtest_win_rate", 0.0),
+            "backtest_score": coin.get("backtest_score", 0.0),
+            "profit_lock_start_pct": coin.get("profit_lock_start_pct", 0.02),
+            "profit_lock_floor_pct": coin.get("profit_lock_floor_pct", 0.01),
+            "profit_lock_drawdown_pct": coin.get("profit_lock_drawdown_pct", 0.02),
+            "lock_rule_label": coin.get(
+                "lock_rule_label", "2% trigger / 2% trail / 1% floor"
+            ),
+        }
+
+    @classmethod
+    def _build_recommended_profile(
+        cls,
+        coins,
+        total_capital,
+        min_trade_size,
+        deployment_ratio,
+        max_positions,
+    ):
         if not coins:
             return None, []
 
-        allocation_order = cls._rank_for_allocation(coins)
+        # The decision agent receives the top-ten ranked coins, but opens a
+        # concentrated basket. This avoids spreading a small account across
+        # too many minimum-size orders.
+        ranked_coins = cls._rank_for_allocation(coins)
+        allocation_order = ranked_coins[:max_positions]
         raw_weights = cls._get_raw_weights(allocation_order)
         normalized_weights = (
             raw_weights
@@ -72,23 +102,14 @@ class PortfolioAllocator:
             zip(allocation_order, normalized_weights),
             start=1,
         ):
-            amount_usdt = total_capital * weight
+            allocation = cls._build_allocation(
+                coin, weight, index, total_capital, deployment_ratio
+            )
+            amount_usdt = allocation["amount_usdt"]
             if amount_usdt < min_trade_size:
                 continue
 
-            allocations.append({
-                "symbol": coin["symbol"],
-                "allocation_pct": weight * 100,
-                "allocation_rank": index,
-                "amount_usdt": amount_usdt,
-                "backtest_avg_return": coin.get("backtest_avg_return", 0.0),
-                "backtest_total_return": coin.get("backtest_total_return", 0.0),
-                "backtest_win_rate": coin.get("backtest_win_rate", 0.0),
-                "backtest_score": coin.get("backtest_score", 0.0),
-                "profit_lock_start_pct": coin.get("profit_lock_start_pct", 0.01),
-                "profit_lock_step_pct": coin.get("profit_lock_step_pct", 0.01),
-                "lock_rule_label": coin.get("lock_rule_label", "1%"),
-            })
+            allocations.append(allocation)
             deployed_capital += amount_usdt
             portfolio_avg_return += weight * coin.get("backtest_avg_return", 0.0)
             portfolio_total_return += weight * coin.get("backtest_total_return", 0.0)
@@ -100,22 +121,27 @@ class PortfolioAllocator:
 
         if not allocations:
             return None, allocation_order
-        
-        # 🔥 Ensure FULL capital deployment (CRITICAL FIX)
-        # If any capital is left unused (due to rounding or min_trade_size),
-        # assign it to the top-ranked coin instead of leaving it idle.
 
-        leftover_capital = total_capital - deployed_capital
-
-        if leftover_capital >= min_trade_size and allocations:
-            allocations[0]["amount_usdt"] += leftover_capital
-            allocations[0]["allocation_pct"] += (leftover_capital / total_capital) * 100
-            deployed_capital += leftover_capital
+        # Keep the rest of the top-ten ranked coins as replacement candidates.
+        # A replacement uses an equal-sized slot, rather than deploying the
+        # entire remaining cash balance into one new name.
+        fallback_weight = 1 / max_positions
+        fallback_allocations = [
+            cls._build_allocation(
+                coin,
+                fallback_weight,
+                index,
+                total_capital,
+                deployment_ratio,
+            )
+            for index, coin in enumerate(ranked_coins[max_positions:], start=max_positions + 1)
+        ]
 
         recommended_profile = {
-            "name": "adaptive_backtest_weighted",
+            "name": "risk_reserved_backtest_weighted",
             "weights": [weight * 100 for weight in normalized_weights],
             "allocations": allocations,
+            "fallback_allocations": fallback_allocations,
             "portfolio_avg_return": portfolio_avg_return,
             "portfolio_total_return": portfolio_total_return,
             "portfolio_win_rate": portfolio_win_rate,
@@ -127,13 +153,26 @@ class PortfolioAllocator:
         return recommended_profile, allocation_order
 
     @classmethod
-    def allocate(cls, coins, total_capital, min_trade_size=5):
-        # Use explicit concentration caps for 1-3 names, then switch to a
-        # full-capital backtest-weighted split once the basket is broader.
+    def allocate(
+        cls,
+        coins,
+        total_capital,
+        min_trade_size=5,
+        deployment_ratio=0.75,
+        max_positions=3,
+    ):
+        if not 0 < deployment_ratio <= 1:
+            raise ValueError("deployment_ratio must be greater than 0 and at most 1")
+        if max_positions < 1:
+            raise ValueError("max_positions must be at least 1")
+
+        # Use a small, risk-reserved basket selected from the top candidates.
         recommended_profile, allocation_order = cls._build_recommended_profile(
             coins,
             total_capital,
             min_trade_size,
+            deployment_ratio,
+            max_positions,
         )
         if recommended_profile is None:
             return {
