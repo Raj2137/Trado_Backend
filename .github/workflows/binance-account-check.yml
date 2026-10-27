@@ -1,0 +1,58 @@
+name: Binance read-only account check
+
+on:
+  workflow_dispatch:
+    inputs:
+      testnet:
+        description: Check Spot Testnet instead of the production account
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trado-account-check
+  cancel-in-progress: false
+
+jobs:
+  account-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+      BINANCE_SECRET_KEY: ${{ secrets.BINANCE_SECRET_KEY }}
+      BINANCE_TESTNET_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
+      BINANCE_TESTNET_SECRET_KEY: ${{ secrets.BINANCE_TESTNET_SECRET_KEY }}
+      BINANCE_TESTNET: ${{ inputs.testnet }}
+      PORTFOLIO_ACCOUNT_ID: ${{ vars.PORTFOLIO_ACCOUNT_ID || 'default' }}
+      LIVE_CAPITAL_LIMIT_USDT: ${{ vars.LIVE_CAPITAL_LIMIT_USDT || '0' }}
+      LIVE_MAX_POSITION_USDT: ${{ vars.LIVE_MAX_POSITION_USDT || '0' }}
+      LIVE_TRADING_ENABLED: "false"
+      LIVE_ENTRIES_ENABLED: "false"
+      TRADING_TIMEZONE: Asia/Kolkata
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Require persistent database
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy.engine import make_url
+          value = os.environ.get("DATABASE_URL", "")
+          if not value or make_url(value).get_backend_name() != "postgresql":
+              raise SystemExit("Set DATABASE_URL to a PostgreSQL connection string")
+          PY
+      - name: Inspect balances and bot state without submitting orders
+        run: python -m app.run_cycle --trade-mode reconcile
+      - name: Report account-check failure
+        if: failure()
+        run: |
+          echo '### Binance account check failed' >> "$GITHUB_STEP_SUMMARY"
+          echo 'No trading is enabled by this workflow. Inspect the failed step for credentials, regional access, or reconciliation problems.' >> "$GITHUB_STEP_SUMMARY"

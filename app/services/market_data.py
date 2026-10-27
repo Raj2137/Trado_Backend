@@ -1,4 +1,4 @@
-"""Unauthenticated Binance spot market data for paper mode and scanning."""
+"""Unauthenticated Binance spot data for scanning and paper execution."""
 
 import ccxt
 
@@ -14,5 +14,7 @@ def create_public_spot_exchange():
             "fetchMargins": False,
         },
     })
+    # Binance's documented market-data-only service supports exchangeInfo,
+    # tickers and klines without account credentials or trading endpoints.
     exchange.urls["api"]["public"] = "https://data-api.binance.vision/api/v3"
     return exchange
