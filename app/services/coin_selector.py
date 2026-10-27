@@ -1,9 +1,8 @@
 import logging
 import time
 
-import ccxt
-
 from app.core.config import settings
+from app.services.market_data import create_public_spot_exchange
 
 # Use a module logger so selection decisions can be traced in logs.
 logger = logging.getLogger(__name__)
@@ -38,10 +37,7 @@ class CoinSelector:
 
     def __init__(self):
         # Initialize the exchange client with built-in rate limiting.
-        self.exchange = ccxt.binance({
-            "enableRateLimit": True,
-            "timeout": 30000,  # 30 seconds
-        })
+        self.exchange = create_public_spot_exchange()
 
         # Minimum 24h notional volume to avoid thin markets.
         self.MIN_24H_QUOTE_VOLUME_USD = 5_000_000

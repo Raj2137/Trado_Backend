@@ -1,6 +1,7 @@
 import logging
 import time
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from app.core.config import settings
 from app.services.binance_service import BinanceService
@@ -32,7 +33,7 @@ class PortfolioAgent:
         self.capital_reserve_usdt = 0.0
         self.daily_loss_limit_pct = settings.DAILY_LOSS_LIMIT_PCT
         self.daily_equity_baseline_usdt = self.starting_capital_usdt
-        self.daily_equity_date = date.today()
+        self.daily_equity_date = self._trading_day()
         self.daily_trading_halted = False
         # Use one Binance service for the whole portfolio run.
         self.binance = BinanceService(paper_trading=paper_trading)
@@ -63,6 +64,10 @@ class PortfolioAgent:
     def has_open_positions(self):
         # Let the caller know whether there is anything left to manage.
         return bool(self.positions)
+
+    @staticmethod
+    def _trading_day():
+        return datetime.now(ZoneInfo(settings.TRADING_TIMEZONE)).date()
 
     def restore_state(self, payload):
         """Restore a saved paper portfolio before a scheduled cycle begins."""
@@ -128,7 +133,7 @@ class PortfolioAgent:
 
     def _rollover_daily_loss_guard(self, equity_usdt=None):
         """Start a fresh daily loss budget when the local calendar day changes."""
-        current_day = date.today()
+        current_day = self._trading_day()
         if current_day == self.daily_equity_date:
             return
         self.daily_equity_date = current_day

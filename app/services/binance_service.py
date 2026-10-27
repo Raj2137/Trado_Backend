@@ -5,6 +5,7 @@ import time
 
 
 from app.core.config import settings
+from app.services.market_data import create_public_spot_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +17,15 @@ class BinanceService:
             settings.PAPER_TRADING if paper_trading is None else paper_trading
         )
         self.paper_trading_fee_rate = settings.PAPER_TRADING_FEE_RATE
-        self.exchange = ccxt.binance({
-            "apiKey": settings.BINANCE_API_KEY,
-            "secret": settings.BINANCE_SECRET_KEY,
+        self.exchange = create_public_spot_exchange() if self.paper_trading else ccxt.binance({
+            "apiKey": settings.BINANCE_TESTNET_API_KEY if settings.BINANCE_TESTNET else settings.BINANCE_API_KEY,
+            "secret": settings.BINANCE_TESTNET_SECRET_KEY if settings.BINANCE_TESTNET else settings.BINANCE_SECRET_KEY,
             "enableRateLimit": True,
              "timeout": 30000,  # 30 seconds
+            "options": {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}, "fetchCurrencies": False},
           })
+        if not self.paper_trading and settings.BINANCE_TESTNET:
+            self.exchange.set_sandbox_mode(True)
         self._markets = None
 
     def get_price(self, symbol: str):
@@ -29,10 +33,9 @@ class BinanceService:
         return ticker["last"]
 
     def estimate_fee(self, notional_usdt: float):
-        # Only apply the simplified fee model in paper trading mode.
-        if not self.paper_trading:
-            return 0.0
-        return abs(notional_usdt) * self.paper_trading_fee_rate
+        # Estimate a reserve for exits; live accounting uses confirmed commissions.
+        rate = self.paper_trading_fee_rate if self.paper_trading else settings.LIVE_FEE_RESERVE_PCT
+        return abs(notional_usdt) * rate
     
     def safe_load_markets(self, retries=3):
         for attempt in range(retries):
@@ -79,18 +82,18 @@ class BinanceService:
                 symbol,
                 exc,
             )
-            return 0.0
+            raise RuntimeError("Cannot value an exchange commission; reconciliation required") from exc
 
     def _extract_fee_entries(self, order):
         # Collect fee data from the normalized CCXT fields first.
         fee_entries = []
 
+        fees = order.get("fees") or []
+        if fees:
+            return fees
         fee = order.get("fee")
         if fee:
-            fee_entries.append(fee)
-
-        fees = order.get("fees") or []
-        fee_entries.extend(fees)
+            return [fee]
 
         # Binance sometimes exposes per-fill commissions inside the raw payload.
         raw_fills = order.get("info", {}).get("fills") or []
@@ -121,79 +124,9 @@ class BinanceService:
             )
         return total_fee_usdt
 
-    def _extract_filled_quantity(self, order, fallback_quantity):
-        # Use the actual filled quantity when the exchange returns it.
-        filled_quantity = order.get("filled")
-        if filled_quantity not in (None, 0):
-            return float(filled_quantity)
-        return float(fallback_quantity)
-
-    def _extract_execution_price(self, order, fallback_price, filled_quantity):
-        # Prefer the exchange average price; otherwise derive it from order cost.
-        average_price = order.get("average")
-        if average_price not in (None, 0):
-            return float(average_price)
-
-        cost = order.get("cost")
-        if cost not in (None, 0) and filled_quantity:
-            return float(cost) / float(filled_quantity)
-
-        return float(fallback_price)
-
-    def _fetch_order_details(self, order, symbol):
-        # Some Binance responses omit final fees on the initial create call.
-        order_id = order.get("id")
-        if not order_id:
-            return order
-
-        try:
-            return self.exchange.fetch_order(order_id, symbol)
-        except Exception as exc:
-            logger.debug(
-                "Could not fetch completed order details for %s %s: %s",
-                symbol,
-                order_id,
-                exc,
-            )
-            return order
-
-    def _normalize_live_order(self, order, side, symbol, fallback_quantity, fallback_price):
-        # Convert the raw exchange order into the same shape used by paper mode.
-        detailed_order = self._fetch_order_details(order, symbol)
-        filled_quantity = self._extract_filled_quantity(detailed_order, fallback_quantity)
-        execution_price = self._extract_execution_price(
-            detailed_order,
-            fallback_price=fallback_price,
-            filled_quantity=filled_quantity,
-        )
-        gross_notional = detailed_order.get("cost")
-        if gross_notional in (None, 0):
-            gross_notional = filled_quantity * execution_price
-        fee_usdt = self._extract_order_fee_usdt(
-            detailed_order,
-            symbol=symbol,
-            reference_price=execution_price,
-        )
-
-        normalized = {
-            "mode": "live",
-            "side": side,
-            "symbol": symbol,
-            "quantity": filled_quantity,
-            "price": execution_price,
-            "gross_notional_usdt": gross_notional,
-            "fee_usdt": fee_usdt,
-            "raw_order": detailed_order,
-        }
-
-        if side == "BUY":
-            normalized["net_cost_usdt"] = gross_notional + fee_usdt
-        else:
-            normalized["net_proceeds_usdt"] = gross_notional - fee_usdt
-
-        return normalized
-
     def buy(self, symbol: str, quantity: float, price=None):
+        if not self.paper_trading:
+            raise RuntimeError("Live orders must use the durable live executor")
         execution_price = self.get_price(symbol) if price is None else price
         gross_notional = quantity * execution_price
 
@@ -211,16 +144,9 @@ class BinanceService:
                 "net_cost_usdt": gross_notional + fee_usdt,
             }
 
-        raw_order = self.exchange.create_market_buy_order(symbol, quantity)
-        return self._normalize_live_order(
-            raw_order,
-            side="BUY",
-            symbol=symbol,
-            fallback_quantity=quantity,
-            fallback_price=execution_price,
-        )
-
     def sell(self, symbol: str, quantity: float, price=None):
+        if not self.paper_trading:
+            raise RuntimeError("Live orders must use the durable live executor")
         execution_price = self.get_price(symbol) if price is None else price
         gross_notional = quantity * execution_price
 
@@ -237,12 +163,3 @@ class BinanceService:
                 "fee_usdt": fee_usdt,
                 "net_proceeds_usdt": gross_notional - fee_usdt,
             }
-
-        raw_order = self.exchange.create_market_sell_order(symbol, quantity)
-        return self._normalize_live_order(
-            raw_order,
-            side="SELL",
-            symbol=symbol,
-            fallback_quantity=quantity,
-            fallback_price=execution_price,
-        )

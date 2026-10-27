@@ -131,6 +131,8 @@ def main():
    
     args = parse_args()
     paper_trading = args.trade_mode == "paper"
+    if not paper_trading:
+        raise RuntimeError("Use app.run_cycle --trade-mode live with the durable live executor; the legacy worker is paper-only")
 
     # Build the selector service that knows how to scan Binance markets.
     selector = CoinSelector()
