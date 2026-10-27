@@ -45,6 +45,42 @@ influencing the portfolio when the research service is unavailable.
 
 ## Scheduled deployment
 
+### 24–48 hour paper evaluation
+
+Use **Trado paper scheduler** for the experiment. The other workflows shown in
+GitHub check code or account access; they do not run the trading strategy.
+Start one paper run manually, confirm success, then leave its existing
+15-minute schedule enabled. No Binance API keys are needed for paper mode.
+
+Each run writes a **Paper trading evaluation** table on the GitHub run Summary
+page and appends a snapshot to the database table `paper_performance`. It shows
+elapsed hours, starting/current equity, test P&L, the 5% target, current target
+status, first observed target crossing, sampled maximum drawdown, cash, open
+positions, realized/unrealized P&L, and intervals between observations.
+
+The target is **5% total return over the observation window**, not 5% per day.
+A fresh 100 USDT portfolio therefore has a 105 USDT target. Equity includes
+cash plus marked open positions minus estimated sale fees; simulated purchase
+fees are already paid. It is not the same as completed, realized trading profit.
+The existing paper model does not simulate live slippage or account for taxes
+and hosting costs.
+
+The evaluation baseline starts on the first run with reporting enabled and
+persists inside `portfolio_state.payload.paper_evaluation`. Existing positions
+and cash are retained and valued at that first observation. Do not reset the
+database or change strategy/capital midway through a comparison. No missing
+history is backfilled, and lifetime realized P&L may predate this test window.
+The scheduler keeps running after 24 hours, 48 hours, or a target crossing; it
+does not automatically liquidate positions or enable real trading. Drawdown is
+sampled at cycle times, so losses between checks may be larger.
+
+This local checkout does not contain the separately developed live safeguards;
+its `run_cycle --trade-mode live` is therefore blocked. Before real-money
+activation, merge/restore and validate the durable live executor, reconcile the
+account, verify protective orders on Spot Testnet, and configure a permitted
+live host. A positive 1–2 day paper result alone is not evidence of dependable
+future profit.
+
 For a scheduler that invokes the bot every 15 minutes, use the one-cycle
 command below. It loads saved portfolio state, protects open positions, scans
 the current top two candidates, obtains optional LLM research before entries,

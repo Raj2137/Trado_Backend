@@ -5,6 +5,7 @@ import time
 
 
 from app.core.config import settings
+from app.services.market_data import create_public_spot_exchange
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class BinanceService:
             settings.PAPER_TRADING if paper_trading is None else paper_trading
         )
         self.paper_trading_fee_rate = settings.PAPER_TRADING_FEE_RATE
-        self.exchange = ccxt.binance({
+        self.exchange = create_public_spot_exchange() if self.paper_trading else ccxt.binance({
             "apiKey": settings.BINANCE_API_KEY,
             "secret": settings.BINANCE_SECRET_KEY,
             "enableRateLimit": True,

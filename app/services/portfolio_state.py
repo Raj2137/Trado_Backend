@@ -26,6 +26,13 @@ class PortfolioStateRecord(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class PaperPerformanceRecord(Base):
+    __tablename__ = "paper_performance"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recorded_at = Column(Text, nullable=False)
+    payload = Column(Text, nullable=False)
+
+
 class PortfolioStateStore:
     def __init__(self, database_url=None):
         database_url = database_url or os.getenv(
@@ -57,7 +64,7 @@ class PortfolioStateStore:
         finally:
             session.close()
 
-    def save(self, payload):
+    def save(self, payload, performance=None):
         session = self.session_factory()
         try:
             record = session.get(PortfolioStateRecord, 1)
@@ -73,6 +80,10 @@ class PortfolioStateStore:
             else:
                 record.payload = encoded
                 record.updated_at = updated_at
+            if performance is not None:
+                session.add(PaperPerformanceRecord(
+                    recorded_at=updated_at, payload=json.dumps(performance, sort_keys=True)
+                ))
             session.commit()
         finally:
             session.close()

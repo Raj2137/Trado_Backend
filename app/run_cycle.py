@@ -14,6 +14,7 @@ from app.services.coin_selector import CoinSelector
 from app.services.decision_agent import PortfolioDecisionAgent
 from app.services.llm_research_agent import LLMResearchAgent
 from app.services.portfolio_state import PortfolioStateStore
+from app.services.paper_performance import start_evaluation, record_performance, write_github_summary
 from app.services.trading_agent import PortfolioAgent
 
 
@@ -36,13 +37,18 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.trade_mode != "paper":
+        raise RuntimeError("This checkout is paper-only; restore and validate the durable live executor before enabling real orders")
     state_store = PortfolioStateStore(settings.DATABASE_URL)
     agent = PortfolioAgent(
         monitor_interval_seconds=settings.MONITOR_INTERVAL_SECONDS,
         paper_trading=args.trade_mode == "paper",
         starting_capital_usdt=settings.TOTAL_CAPITAL_USDT,
     )
-    restored = agent.restore_state(state_store.load())
+    saved_state = state_store.load()
+    restored = agent.restore_state(saved_state)
+    evaluation = (saved_state or {}).get("paper_evaluation")
+    cycle_succeeded = False
     logger.info(
         "Starting scheduled %s cycle | restored_state=%s | open_positions=%s | available=%.2f",
         args.trade_mode,
@@ -52,6 +58,7 @@ def main():
     )
 
     try:
+        evaluation = start_evaluation(agent, evaluation)
         # Exit protection has priority and never waits for a scan or an LLM.
         if agent.has_open_positions():
             agent.monitor_positions_once()
@@ -60,6 +67,7 @@ def main():
         # inexpensive check exits, allowing automatic reset on the next day.
         if agent.is_daily_trading_halted():
             logger.warning("Scheduled cycle skipped: daily-loss circuit breaker is active")
+            cycle_succeeded = True
             return
 
         selector = CoinSelector()
@@ -67,6 +75,7 @@ def main():
         coins, recommendation = scan_and_allocate(selector, decision_agent)
         if not recommendation:
             logger.info("Cycle completed: no qualified entry basket; cash remains available")
+            cycle_succeeded = True
             return
 
         agent.update_latest_recommendations([coin["symbol"] for coin in coins])
@@ -80,12 +89,27 @@ def main():
 
         opened = decision_agent.run_minute(agent, recommendation)
         logger.info("Scheduled cycle complete | new_positions=%s", len(opened))
+        cycle_succeeded = True
     except Exception:
         logger.exception("Scheduled cycle failed")
         raise
     finally:
-        state_store.save(agent.export_state())
+        report = None
+        if evaluation is not None:
+            try:
+                report = record_performance(agent, evaluation, cycle_succeeded)
+            except Exception:
+                logger.exception("Paper valuation unavailable; preserving portfolio without inventing a return")
+        payload = agent.export_state()
+        if evaluation is not None:
+            payload["paper_evaluation"] = evaluation
+        state_store.save(payload, performance=report)
         logger.info("Portfolio state saved for the next scheduled cycle")
+        if report is not None:
+            try:
+                write_github_summary(report)
+            except OSError:
+                logger.exception("Could not write the GitHub summary; performance remains saved in the database")
 
 
 if __name__ == "__main__":
