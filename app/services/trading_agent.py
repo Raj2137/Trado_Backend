@@ -64,6 +64,47 @@ class PortfolioAgent:
         # Let the caller know whether there is anything left to manage.
         return bool(self.positions)
 
+    def restore_state(self, payload):
+        """Restore a saved paper portfolio before a scheduled cycle begins."""
+        if not payload:
+            return False
+        self.positions = payload.get("positions", {})
+        self.available_usdt = payload.get("available_usdt", self.available_usdt)
+        self.total_profit_usdt = payload.get("total_profit_usdt", 0.0)
+        self.total_loss_usdt = payload.get("total_loss_usdt", 0.0)
+        self.realized_pnl_usdt = payload.get("realized_pnl_usdt", 0.0)
+        self.total_trades = payload.get("total_trades", 0)
+        self.winning_trades = payload.get("winning_trades", 0)
+        self.losing_trades = payload.get("losing_trades", 0)
+        self.realized_pnl_by_symbol = payload.get("realized_pnl_by_symbol", {})
+        self.reentry_not_before = payload.get("reentry_not_before", {})
+        self.daily_equity_baseline_usdt = payload.get(
+            "daily_equity_baseline_usdt", self.daily_equity_baseline_usdt
+        )
+        saved_day = payload.get("daily_equity_date")
+        if saved_day:
+            self.daily_equity_date = date.fromisoformat(saved_day)
+        self.daily_trading_halted = payload.get("daily_trading_halted", False)
+        return True
+
+    def export_state(self):
+        """Return all data required for the next independent scheduler run."""
+        return {
+            "positions": self.positions,
+            "available_usdt": self.available_usdt,
+            "total_profit_usdt": self.total_profit_usdt,
+            "total_loss_usdt": self.total_loss_usdt,
+            "realized_pnl_usdt": self.realized_pnl_usdt,
+            "total_trades": self.total_trades,
+            "winning_trades": self.winning_trades,
+            "losing_trades": self.losing_trades,
+            "realized_pnl_by_symbol": self.realized_pnl_by_symbol,
+            "reentry_not_before": self.reentry_not_before,
+            "daily_equity_baseline_usdt": self.daily_equity_baseline_usdt,
+            "daily_equity_date": self.daily_equity_date.isoformat(),
+            "daily_trading_halted": self.daily_trading_halted,
+        }
+
     def update_latest_recommendations(self, symbols):
         # Keep the latest top-ranked symbols so weak holdings can be compared
         # against the current shortlist instead of stale entries.
