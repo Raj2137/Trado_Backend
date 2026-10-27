@@ -5,5 +5,6 @@ __pycache__/
 *.pyo
 *.pyd
 .env
+data/
 .python-version
 .DS_Store

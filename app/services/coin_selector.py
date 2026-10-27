@@ -382,7 +382,14 @@ class CoinSelector:
                 )
                 time.sleep(retry_delay_seconds)
 
-    def get_top_coins(self, limit=10):
+    def get_top_coins(self, limit=10, result_limit=None):
+        """Backtest a wider shortlist, then return the final investable set.
+
+        ``limit`` bounds expensive backtesting. ``result_limit`` is the final
+        number of qualified coins returned for allocation.
+        """
+        if result_limit is None:
+            result_limit = limit
         # Load market metadata once so symbol-level checks are cheap.
         logger.info("Loading markets...")
         
@@ -701,7 +708,7 @@ class CoinSelector:
             reverse=True
         )
 
-        top = candidates[:limit]
+        top = candidates[:result_limit]
 
         # Emit a summary for visibility and debugging.
         logger.info(f"Selected top {len(top)} coins")

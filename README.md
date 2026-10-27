@@ -1,11 +1,13 @@
 # Trado Backend
 
-This repo can run as a long-lived paper-trading worker.
+This repo can run either as a long-lived paper-trading worker or as a durable
+scheduled task.
 
 ## Current trading policy
 
-- The selector ranks the top 10 qualifying USDT spot pairs using seven days
-  of hourly data, and backtests the same seven-day window.
+- The selector prefilters liquid USDT pairs, backtests the strongest 10 live
+  candidates using seven days of hourly data, then returns only the best 2
+  qualified coins for allocation.
 - The decision agent considers only the top two qualified coins. One coin
   receives 100% of available capital; two coins receive a 70% / 30% split.
   Only exchange-fee dust remains idle.
@@ -41,7 +43,26 @@ advice is treated as neutral and never blocks the one-minute risk monitor.
 Advice also expires after 20 minutes by default, preventing stale research from
 influencing the portfolio when the research service is unavailable.
 
-## Local or VM deployment
+## Scheduled deployment
+
+For a scheduler that invokes the bot every 15 minutes, use the one-cycle
+command below. It loads saved portfolio state, protects open positions, scans
+the current top two candidates, obtains optional LLM research before entries,
+saves the resulting state, and exits:
+
+```bash
+python -m app.run_cycle --trade-mode paper
+```
+
+Local runs default to SQLite at `data/portfolio_state.db`. A cloud scheduler
+must set `DATABASE_URL` to a persistent PostgreSQL database; a container's
+local filesystem is not reliable storage between scheduled invocations.
+
+Keep the scheduler enabled after the daily-loss circuit breaker trips. The
+cycle exits before scans or LLM work while halted, then automatically resets
+the guard on the next calendar day.
+
+## Long-lived worker deployment
 
 For a Docker host, copy the environment template and run the worker with
 Docker Compose. The included restart policy brings the process back after a
@@ -75,6 +96,7 @@ python -m app.run_agent --trade-mode paper
 
 ## Current limitation
 
-Paper mode is safe to test, but the bot is stateless across restarts. Open
-positions, available capital, and realized PnL are only kept in process memory.
-If the worker restarts, paper-trading state resets.
+The scheduled mode persists the portfolio ledger but does not yet place
+exchange-native protective orders. A 15-minute scheduler can only act at each
+scheduled check, so real-money trading should use a more frequent monitor or
+exchange-native protection.

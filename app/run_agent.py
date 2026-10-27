@@ -63,7 +63,10 @@ def log_selected_coins(coins):
 
 def scan_and_allocate(selector, decision_agent):
     # Run a fresh market scan and compute the best portfolio split for it.
-    coins = selector.get_top_coins(limit=settings.MAX_OPEN_POSITIONS)
+    coins = selector.get_top_coins(
+        limit=settings.BACKTEST_CANDIDATE_LIMIT,
+        result_limit=settings.MAX_OPEN_POSITIONS,
+    )
     if not coins:
         logger.warning("No qualified coins found in this scan")
         return [], None

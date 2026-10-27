@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/portfolio_state.db")
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
     BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
     PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
@@ -16,6 +17,8 @@ class Settings:
     # fees leave a small unavoidable cash remainder.
     INITIAL_DEPLOYMENT_RATIO = float(os.getenv("INITIAL_DEPLOYMENT_RATIO", "1.0"))
     MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+    # Evaluate this wider live-signal shortlist before choosing the final two.
+    BACKTEST_CANDIDATE_LIMIT = int(os.getenv("BACKTEST_CANDIDATE_LIMIT", "10"))
     MIN_TRADE_SIZE_USDT = float(os.getenv("MIN_TRADE_SIZE_USDT", "5"))
     STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.02"))
     # Halt new entries for the remainder of the calendar day after this
