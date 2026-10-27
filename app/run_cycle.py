@@ -8,6 +8,8 @@ fails, so a later invocation resumes the same portfolio.
 import argparse
 import logging
 
+from sqlalchemy.engine import make_url
+
 from app.core.config import settings
 from app.run_agent import get_research_positions, scan_and_allocate
 from app.services.coin_selector import CoinSelector
@@ -39,6 +41,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if settings.REQUIRE_PERSISTENT_DATABASE and make_url(settings.DATABASE_URL).get_backend_name() != "postgresql":
+        raise RuntimeError("This deployment requires DATABASE_URL pointing to the existing PostgreSQL portfolio; SQLite is not allowed")
     mode = "paper" if args.trade_mode == "paper" else ("testnet" if settings.BINANCE_TESTNET else "live")
     state_store = PortfolioStateStore(settings.DATABASE_URL, mode=mode, account_id=settings.PORTFOLIO_ACCOUNT_ID)
     with state_store.cycle_lock():

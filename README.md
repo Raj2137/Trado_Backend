@@ -46,15 +46,53 @@ influencing the portfolio when the research service is unavailable.
 
 ## Scheduled deployment
 
+### Render cron (primary scheduler)
+
+The repository's `render.yaml` creates a **paper-only Cron Job** on the smallest
+listed compute plan in Singapore. It runs `app.run_cycle` every 15 minutes at
+`:00`, `:15`, `:30`, and `:45` (UTC; the minute pattern is the same in India).
+It runs the Python command directly, not through GitHub Actions. Render bills
+active compute usage with a **$1 minimum per cron service per month**; the
+minimum is not a price cap. Confirm the displayed plan/cost before creating it.
+
+1. Push/merge `render.yaml` and the workflow change into GitHub's `main` branch.
+2. Sign in to Render and choose **New → Blueprint**. Connect `Trado_Backend`,
+   select `main`, and use the root `render.yaml`.
+3. Enter **the same Neon `DATABASE_URL`** currently stored in GitHub Secrets.
+   Render does not automatically receive GitHub Actions secrets. Do not create
+   a new database or change `PORTFOLIO_ACCOUNT_ID` from the existing `default`.
+4. Review the paid Cron Job and create it. Wait for the build to succeed.
+5. Open **trado-paper-scheduler → Runs**. Trigger one test run when none is
+   active, then confirm the next **scheduled** run appears without clicking.
+6. Inspect each run's logs for `restored_state=True`, your existing positions,
+   and `PAPER EVALUATION`. The observation baseline and `paper_performance`
+   history stay in Neon. Render logs replace the GitHub summary for cron runs.
+
+No Binance credentials are required for this paper job. Real trading and LLM
+calls remain disabled. `REQUIRE_PERSISTENT_DATABASE=true` prevents accidental
+fallback to a fresh, temporary SQLite database. `runtime: python` ensures the
+cron command is used rather than the Dockerfile's continuous-worker command.
+
+The GitHub paper workflow is now a **manual fallback** and has no cron trigger.
+Stop any other scheduler using this portfolio. The shared PostgreSQL lock
+prevents overlapping writers, but two schedulers could still run consecutive
+cycles more often than intended. A manual Render trigger cancels an active run,
+so wait for it to finish before using **Trigger Run**. Scheduled runs wait for
+an already-running cycle to finish. Provider outages, build failures, and API
+latency can still delay runs; this is not an exact-time execution guarantee.
+
+Reference: https://render.com/docs/cronjobs
+
 ### 24–48 hour paper evaluation
 
-Use **Trado paper scheduler** for the experiment. The other workflows shown in
-GitHub check code or account access; they do not run the trading strategy.
-Start one paper run manually, confirm success, then leave its existing
-15-minute schedule enabled. No Binance API keys are needed for paper mode.
+Use **trado-paper-scheduler on Render** for the experiment. The other workflows
+in GitHub check code or account access; **Trado paper check (manual fallback)**
+can run an unscheduled paper check. Confirm a Render run succeeds, then confirm
+the next automatic run appears. No Binance API keys are needed for paper mode.
 
-Each run writes a **Paper trading evaluation** table on the GitHub run Summary
-page and appends a snapshot to the database table `paper_performance`. It shows
+Each run logs `PAPER EVALUATION` and appends a snapshot to the database table
+`paper_performance`. A manual GitHub run also writes a **Paper trading
+evaluation** table on its Summary page. The stored report includes
 elapsed hours, starting/current equity, test P&L, the 5% target, current target
 status, first observed target crossing, sampled maximum drawdown, cash, open
 positions, realized/unrealized P&L, and intervals between observations.

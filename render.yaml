@@ -1,0 +1,36 @@
+# Paper-only scheduled execution; keep the existing Neon portfolio database.
+services:
+  - type: cron
+    name: trado-paper-scheduler
+    runtime: python
+    plan: 0.5c-512mb
+    region: singapore
+    branch: main
+    schedule: "*/15 * * * *"
+    buildCommand: python -m pip install -r requirements.txt
+    startCommand: python -m app.run_cycle --trade-mode paper
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.17"
+      - key: DATABASE_URL
+        sync: false
+      - key: REQUIRE_PERSISTENT_DATABASE
+        value: "true"
+      - key: PAPER_TRADING
+        value: "true"
+      - key: TOTAL_CAPITAL_USDT
+        value: "100"
+      - key: PORTFOLIO_ACCOUNT_ID
+        value: default
+      - key: LLM_ADVISOR_ENABLED
+        value: "false"
+      - key: LIVE_TRADING_ENABLED
+        value: "false"
+      - key: LIVE_ENTRIES_ENABLED
+        value: "false"
+      - key: TZ
+        value: Asia/Kolkata
+      - key: TRADING_TIMEZONE
+        value: Asia/Kolkata
+      - key: PYTHONUNBUFFERED
+        value: "1"
