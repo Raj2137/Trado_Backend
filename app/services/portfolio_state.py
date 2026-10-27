@@ -11,6 +11,7 @@ import os
 from datetime import datetime, timezone
 
 from sqlalchemy import Column, Integer, Text, create_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 
@@ -30,12 +31,20 @@ class PortfolioStateStore:
         database_url = database_url or os.getenv(
             "DATABASE_URL", "sqlite:///./data/portfolio_state.db"
         )
-        if database_url.startswith("sqlite:///"):
-            sqlite_path = database_url.removeprefix("sqlite:///")
+        # Connection dialogs may select psycopg v3. This application ships
+        # psycopg2-binary, so use that driver while preserving credentials and
+        # connection options (including SSL) in the supplied URL.
+        parsed_url = make_url(database_url)
+        if parsed_url.drivername in (
+            "postgres", "postgresql", "postgresql+psycopg"
+        ):
+            database_url = parsed_url.set(drivername="postgresql+psycopg2")
+        if parsed_url.get_backend_name() == "sqlite":
+            sqlite_path = parsed_url.database or ""
             parent_directory = os.path.dirname(sqlite_path)
             if parent_directory:
                 os.makedirs(parent_directory, exist_ok=True)
-        connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+        connect_args = {"check_same_thread": False} if parsed_url.get_backend_name() == "sqlite" else {}
         self.engine = create_engine(database_url, connect_args=connect_args)
         Base.metadata.create_all(self.engine)
         self.session_factory = sessionmaker(bind=self.engine)
