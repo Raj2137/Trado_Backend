@@ -1,0 +1,38 @@
+name: Backend safety checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  safety-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: trado_test
+          POSTGRES_PASSWORD: local_test_only
+          POSTGRES_DB: trado_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trado_test -d trado_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      LIVE_TRADING_ENABLED: "false"
+      LIVE_ENTRIES_ENABLED: "false"
+      TEST_POSTGRES_URL: postgresql+psycopg2://trado_test:local_test_only@localhost:5432/trado_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -v

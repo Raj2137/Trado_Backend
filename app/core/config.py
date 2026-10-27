@@ -4,6 +4,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 class Settings:
+    TRADING_TIMEZONE = os.getenv("TRADING_TIMEZONE", "Asia/Kolkata")
+    PORTFOLIO_ACCOUNT_ID = os.getenv("PORTFOLIO_ACCOUNT_ID", "default")
+    LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+    LIVE_ENTRIES_ENABLED = os.getenv("LIVE_ENTRIES_ENABLED", "false").lower() == "true"
+    LIVE_CAPITAL_LIMIT_USDT = float(os.getenv("LIVE_CAPITAL_LIMIT_USDT", "0"))
+    LIVE_MAX_POSITION_USDT = float(os.getenv("LIVE_MAX_POSITION_USDT", "0"))
+    LIVE_DAILY_LOSS_LIMIT_PCT = float(os.getenv("LIVE_DAILY_LOSS_LIMIT_PCT", "0.02"))
+    LIVE_FEE_RESERVE_PCT = float(os.getenv("LIVE_FEE_RESERVE_PCT", "0.005"))
+    LIVE_MAX_SPREAD_PCT = float(os.getenv("LIVE_MAX_SPREAD_PCT", "0.003"))
+    LIVE_STOP_LIMIT_GAP_PCT = float(os.getenv("LIVE_STOP_LIMIT_GAP_PCT", "0.005"))
+    LIVE_MONITOR_INTERVAL_SECONDS = int(os.getenv("LIVE_MONITOR_INTERVAL_SECONDS", "15"))
+    BINANCE_TESTNET = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
+    BINANCE_TESTNET_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY")
+    BINANCE_TESTNET_SECRET_KEY = os.getenv("BINANCE_TESTNET_SECRET_KEY")
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/portfolio_state.db")
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
     BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
