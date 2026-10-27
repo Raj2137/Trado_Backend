@@ -14,6 +14,7 @@ from app.services.coin_selector import CoinSelector
 from app.services.decision_agent import PortfolioDecisionAgent
 from app.services.llm_research_agent import LLMResearchAgent
 from app.services.portfolio_state import PortfolioStateStore
+from app.services.paper_performance import start_evaluation, record_performance, write_github_summary
 from app.services.trading_agent import PortfolioAgent
 from app.services.live_trading import LivePortfolioAgent
 
@@ -66,7 +67,10 @@ def run_paper_cycle(state_store, monitor_only=False):
         paper_trading=True,
         starting_capital_usdt=settings.TOTAL_CAPITAL_USDT,
     )
-    restored = agent.restore_state(state_store.load())
+    saved_state = state_store.load()
+    restored = agent.restore_state(saved_state)
+    evaluation = (saved_state or {}).get("paper_evaluation")
+    cycle_succeeded = False
     logger.info(
         "Starting scheduled paper cycle | restored_state=%s | open_positions=%s | available=%.2f",
         restored,
@@ -75,10 +79,29 @@ def run_paper_cycle(state_store, monitor_only=False):
     )
 
     try:
+        evaluation = start_evaluation(agent, evaluation)
         run_strategy_cycle(agent, monitor_only)
+        cycle_succeeded = True
+    except Exception:
+        logger.exception("Scheduled paper cycle failed")
+        raise
     finally:
-        state_store.save(agent.export_state())
+        report = None
+        if evaluation is not None:
+            try:
+                report = record_performance(agent, evaluation, cycle_succeeded)
+            except Exception:
+                logger.exception("Paper valuation unavailable; preserving portfolio without inventing a return")
+        payload = agent.export_state()
+        if evaluation is not None:
+            payload["paper_evaluation"] = evaluation
+        state_store.save(payload, performance=report)
         logger.info("Portfolio state saved for the next scheduled cycle")
+        if report is not None:
+            try:
+                write_github_summary(report)
+            except OSError:
+                logger.exception("Could not write the GitHub summary; performance remains saved in the database")
 
 
 def run_strategy_cycle(agent, monitor_only=False):

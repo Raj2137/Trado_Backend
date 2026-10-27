@@ -4,7 +4,9 @@ import os
 import unittest
 import uuid
 
-from app.services.portfolio_state import PortfolioStateStore
+from sqlalchemy import select
+
+from app.services.portfolio_state import PortfolioStateStore, PaperPerformanceRecord
 
 
 @unittest.skipUnless(os.getenv("TEST_POSTGRES_URL"), "TEST_POSTGRES_URL is not configured")
@@ -37,6 +39,14 @@ class PostgresStateTests(unittest.TestCase):
             self.assertIsNone(self.paper.load())
         with self.second.cycle_lock():
             self.second.save({"available_usdt": 98})
+        # Reporting and journal acknowledgements share the merged save API,
+        # while paper history stays separate from the live snapshot.
+        with self.paper.cycle_lock():
+            self.paper.save({"available_usdt": 105}, performance={"test_return_pct": 5})
+        with self.paper.session_factory() as session:
+            rows = session.scalars(select(PaperPerformanceRecord)).all()
+            self.assertTrue(rows)
+        self.assertEqual(self.second.load(), {"available_usdt": 98})
 
 
 if __name__ == "__main__":

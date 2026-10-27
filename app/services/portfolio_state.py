@@ -28,6 +28,13 @@ class PortfolioStateRecord(Base):
     updated_at = Column(Text, nullable=False)
 
 
+class PaperPerformanceRecord(Base):
+    __tablename__ = "paper_performance"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    recorded_at = Column(Text, nullable=False)
+    payload = Column(Text, nullable=False)
+
+
 class ScopedPortfolioRecord(Base):
     __tablename__ = "portfolio_state_scoped"
     scope = Column(String(160), primary_key=True)
@@ -87,7 +94,7 @@ class PortfolioStateStore:
         finally:
             session.close()
 
-    def save(self, payload, applied_orders=()):
+    def save(self, payload, applied_orders=(), performance=None):
         self.assert_lock_for_live()
         session = self.session_factory()
         try:
@@ -104,6 +111,13 @@ class PortfolioStateStore:
             else:
                 record.payload = encoded
                 record.updated_at = updated_at
+            if performance is not None:
+                if self.mode != "paper":
+                    raise ValueError("Paper performance cannot be recorded for a live portfolio")
+                session.add(PaperPerformanceRecord(
+                    recorded_at=updated_at,
+                    payload=json.dumps({**performance, "scope": self.scope}, sort_keys=True),
+                ))
             for client_id in applied_orders:
                 journal = session.get(OrderJournalRecord, client_id)
                 if journal is None or journal.scope != self.scope:
