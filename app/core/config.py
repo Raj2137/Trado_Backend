@@ -19,6 +19,7 @@ class Settings:
     BINANCE_TESTNET_API_KEY = os.getenv("BINANCE_TESTNET_API_KEY")
     BINANCE_TESTNET_SECRET_KEY = os.getenv("BINANCE_TESTNET_SECRET_KEY")
     DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/portfolio_state.db")
+    REQUIRE_PERSISTENT_DATABASE = os.getenv("REQUIRE_PERSISTENT_DATABASE", "false").lower() == "true"
     BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
     BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
     PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"

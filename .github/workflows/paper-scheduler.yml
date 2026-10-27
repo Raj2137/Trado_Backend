@@ -1,9 +1,9 @@
-name: Trado paper scheduler
+name: Trado paper check (manual fallback)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "7,22,37,52 * * * *"
+  # Render owns the recurring schedule (render.yaml). Do not enable a second
+  # automatic scheduler against the same portfolio.
 
 permissions:
   contents: read

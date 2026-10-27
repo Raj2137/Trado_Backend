@@ -101,6 +101,14 @@ class PaperPerformanceTests(unittest.TestCase):
             profile = PortfolioDecisionAgent(100).recommend(coins)
         self.assertEqual([item['amount_usdt'] for item in profile['allocations']], [50, 50])
 
+    def test_hosted_job_cannot_silently_start_fresh_sqlite_portfolio(self):
+        with patch.multiple(settings, REQUIRE_PERSISTENT_DATABASE=True, DATABASE_URL='sqlite:///:memory:'):
+            with patch('sys.argv', ['run_cycle', '--trade-mode', 'paper']):
+                with patch.object(run_cycle, 'PortfolioStateStore') as store:
+                    with self.assertRaisesRegex(RuntimeError, 'SQLite is not allowed'):
+                        run_cycle.main()
+                    store.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
