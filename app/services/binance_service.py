@@ -22,7 +22,15 @@ class BinanceService:
             "secret": settings.BINANCE_TESTNET_SECRET_KEY if settings.BINANCE_TESTNET else settings.BINANCE_SECRET_KEY,
             "enableRateLimit": True,
              "timeout": 30000,  # 30 seconds
-            "options": {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}, "fetchCurrencies": False},
+            "options": {
+                "defaultType": "spot",
+                "fetchMarkets": {"types": ["spot"]},
+                "fetchCurrencies": False,
+                # Reconciliation deliberately checks account-wide open orders
+                # to detect manual orders that could consume the bot's funds.
+                # CCXT still applies the endpoint's higher request weight.
+                "fetchOpenOrders": {"warnWithoutSymbol": False},
+            },
           })
         if not self.paper_trading and settings.BINANCE_TESTNET:
             self.exchange.set_sandbox_mode(True)
