@@ -19,6 +19,7 @@ from app.services.portfolio_state import PortfolioStateStore
 from app.services.paper_performance import start_evaluation, record_performance, write_github_summary
 from app.services.trading_agent import PortfolioAgent
 from app.services.live_trading import LivePortfolioAgent
+from app.services.error_reporting import redact_error
 
 
 logging.basicConfig(
@@ -52,14 +53,21 @@ def main():
                 agent.bootstrap(read_only=args.trade_mode == "reconcile")
                 if args.trade_mode == "reconcile":
                     return
+                agent.last_stage = "strategy/monitor cycle"
                 run_strategy_cycle(agent, monitor_only=args.monitor_only)
+                agent.last_stage = "saving portfolio"
                 agent.checkpoint()
             except Exception as exc:
                 # Do not save an in-memory snapshot after failed live application.
                 # The journal plus last committed state drive restart recovery.
-                logger.error("Live cycle stopped (%s). Resolve the order/balance discrepancy before continuing.", type(exc).__name__)
-                if isinstance(exc, RuntimeError):
-                    logger.error("%s", exc)
+                credentials = [getattr(settings, name, None) for name in (
+                    "BINANCE_API_KEY", "BINANCE_SECRET_KEY", "BINANCE_TESTNET_API_KEY",
+                    "BINANCE_TESTNET_SECRET_KEY", "OPENAI_API_KEY", "DATABASE_URL",
+                )]
+                logger.error("%s stopped during %s (%s).",
+                             "Read-only account check" if args.trade_mode == "reconcile" else "Live cycle",
+                             agent.last_stage, type(exc).__name__)
+                logger.error("Details: %s", redact_error(exc, credentials))
                 raise SystemExit(1) from None
         else:
             run_paper_cycle(state_store, args.monitor_only)

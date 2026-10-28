@@ -159,6 +159,25 @@ class LiveTests(unittest.TestCase):
             with self.assertRaises(LiveSafetyError):
                 self.agent().validate_configuration()
 
+    def test_read_only_reports_low_balance_without_budget_or_orders(self):
+        self.exchange.cash = 1.5
+        with patch.multiple(settings, LIVE_CAPITAL_LIMIT_USDT=0, LIVE_MAX_POSITION_USDT=0, LIVE_TRADING_ENABLED=False):
+            with self.store.cycle_lock():
+                with self.assertLogs('app.services.live_trading', level='INFO') as logs:
+                    self.agent().bootstrap(read_only=True)
+        self.assertTrue(any('free USDT=1.50' in line for line in logs.output))
+        self.assertTrue(any('purchase minimum' in line for line in logs.output))
+        self.assertFalse(self.exchange.submissions)
+        self.assertIsNone(self.store.load())
+
+    def test_low_balance_still_cannot_initialize_live_trading(self):
+        self.exchange.cash = 1.5
+        with self.store.cycle_lock():
+            with self.assertRaisesRegex(LiveSafetyError, 'Insufficient free USDT'):
+                self.agent().bootstrap()
+        self.assertFalse(self.exchange.submissions)
+        self.assertIsNone(self.store.load())
+
     def test_paper_legacy_state_is_never_imported_into_live(self):
         with self.store.session_factory() as session:
             session.add(PortfolioStateRecord(id=1, payload='{"available_usdt": 321}', updated_at="test"))

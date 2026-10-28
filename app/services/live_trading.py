@@ -31,6 +31,7 @@ class LivePortfolioAgent(PortfolioAgent):
         self.daily_loss_limit_pct = settings.LIVE_DAILY_LOSS_LIMIT_PCT
         self.blocked = False
         self.initialized = False
+        self.last_stage = "initialization"
         self.identity = hashlib.sha256((self.exchange.apiKey or "").encode()).hexdigest()
 
     def export_state(self):
@@ -56,42 +57,52 @@ class LivePortfolioAgent(PortfolioAgent):
         if entry and (not settings.LIVE_ENTRIES_ENABLED or self.is_daily_trading_halted()):
             raise LiveSafetyError("New live entries are paused; protective exits remain enabled")
 
-    def validate_configuration(self):
+    def validate_configuration(self, read_only=False):
         if not self.exchange.apiKey or not self.exchange.secret:
             raise LiveSafetyError("Binance credentials are missing for the selected environment")
         expected_mode = "testnet" if settings.BINANCE_TESTNET else "live"
         if self.store.mode != expected_mode:
             raise LiveSafetyError("Exchange environment and database scope do not match")
-        for name in ("LIVE_CAPITAL_LIMIT_USDT", "LIVE_MAX_POSITION_USDT"):
-            value = getattr(settings, name)
-            if not math.isfinite(value) or value <= 0:
-                raise LiveSafetyError(f"Set an explicit positive {name}")
+        if not read_only:
+            for name in ("LIVE_CAPITAL_LIMIT_USDT", "LIVE_MAX_POSITION_USDT"):
+                value = getattr(settings, name)
+                if not math.isfinite(value) or value <= 0:
+                    raise LiveSafetyError(f"Set an explicit positive {name}")
         for name in ("LIVE_DAILY_LOSS_LIMIT_PCT", "LIVE_FEE_RESERVE_PCT", "STOP_LOSS_PCT", "LIVE_STOP_LIMIT_GAP_PCT", "LIVE_MAX_SPREAD_PCT"):
             value = getattr(settings, name)
             if not math.isfinite(value) or not 0 < value < 1:
                 raise LiveSafetyError(f"{name} must be between 0 and 1")
 
-    def _restore(self):
+    def _restore(self, read_only=False):
         payload = self.store.load()
         if payload:
             if payload.get("mode") != self.store.mode or payload.get("account_fingerprint") != self.identity:
                 raise LiveSafetyError("Saved state belongs to another mode or API key; reconciliation/migration required")
-            if payload.get("capital_limit_usdt") != settings.LIVE_CAPITAL_LIMIT_USDT:
+            if not read_only and payload.get("capital_limit_usdt") != settings.LIVE_CAPITAL_LIMIT_USDT:
                 raise LiveSafetyError("Live capital cap changed; reconcile the saved budget before changing it")
             self.restore_state(payload)
             self.starting_capital_usdt = payload["starting_capital_usdt"]
             self.initialized = payload.get("initialized", False)
 
     def bootstrap(self, read_only=False):
-        self.validate_configuration()
-        self._restore()
+        self.last_stage = "validating local settings"
+        self.validate_configuration(read_only=read_only)
+        self.last_stage = "restoring saved state"
+        self._restore(read_only=read_only)
+        self.last_stage = "loading Binance spot markets"
+        logger.info("Account check: loading Binance spot markets")
         self.exchange.load_markets()
         if not read_only:
             self._gate()
             # Resolve journalled outcomes before trusting the portfolio snapshot.
             self.recover_orders()
+        self.last_stage = "reading Binance Spot wallet balances"
+        logger.info("Account check: reading Binance Spot wallet balances")
         balances = self.exchange.fetch_balance()
+        self.last_stage = "reading Binance open orders"
+        logger.info("Account check: reading Binance open orders")
         open_orders = self.exchange.fetch_open_orders()
+        self.last_stage = "reconciling wallet balances and saved holdings"
         known = {item["client_id"] for item in self.store.journal_orders()}
         managed_bases = {symbol.split("/")[0] for symbol in self.positions}
         for order in open_orders:
@@ -102,8 +113,9 @@ class LivePortfolioAgent(PortfolioAgent):
                 raise LiveSafetyError("Unmanaged open order conflicts with bot funds; reconcile it first")
         actual_cash = float(balances.get("free", {}).get("USDT", 0) or 0)
         if not self.initialized:
-            self.available_usdt = min(settings.LIVE_CAPITAL_LIMIT_USDT, actual_cash)
-            if self.available_usdt < settings.MIN_TRADE_SIZE_USDT:
+            budget = settings.LIVE_CAPITAL_LIMIT_USDT
+            self.available_usdt = min(budget, actual_cash) if math.isfinite(budget) and budget > 0 else 0.0
+            if not read_only and self.available_usdt < settings.MIN_TRADE_SIZE_USDT:
                 raise LiveSafetyError("Insufficient free USDT for the configured bot budget")
             self.daily_equity_baseline_usdt = self.available_usdt
             self.starting_capital_usdt = self.available_usdt
@@ -121,6 +133,8 @@ class LivePortfolioAgent(PortfolioAgent):
         pending = [item for item in self.store.journal_orders() if not item.get("applied")]
         if read_only:
             logger.info("Read-only check: no orders submitted or canceled; journal records awaiting reconciliation=%s", len(pending))
+            if actual_cash < settings.MIN_TRADE_SIZE_USDT:
+                logger.warning("Free USDT is below the bot's %.2f USDT purchase minimum; this account check does not enable trading", settings.MIN_TRADE_SIZE_USDT)
             return
         self.checkpoint()
         self._evaluate_daily_loss_guard(self._get_portfolio_summary()["equity_usdt"])
