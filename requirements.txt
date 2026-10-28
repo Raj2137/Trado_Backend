@@ -4,3 +4,4 @@ python-dotenv
 ccxt
 sqlalchemy
 psycopg2-binary
+tzdata

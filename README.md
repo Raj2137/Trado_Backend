@@ -46,6 +46,15 @@ influencing the portfolio when the research service is unavailable.
 
 ## Scheduled deployment
 
+### Always-on Windows computer
+
+An existing Windows computer can run the paper cycle using Task Scheduler,
+without cloud hosting fees. Use the existing Neon database to preserve state.
+See [Windows setup](docs/windows-paper-setup.md) for installation, the paper-only
+launcher, recurring task settings, power requirements, and verification steps.
+Choose one scheduler owner: Windows or Render. Disable the deployed GitHub cron
+if it is still active, and do not schedule the same portfolio from a Mac too.
+
 ### Render cron (primary scheduler)
 
 The repository's `render.yaml` creates a **paper-only Cron Job** on the smallest
