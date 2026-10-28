@@ -9,6 +9,7 @@ supplied through ``DATABASE_URL`` for cloud deployment.
 import json
 import os
 import hashlib
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -157,13 +158,22 @@ class PortfolioStateStore:
                     raise RuntimeError("Another cycle is managing this portfolio")
                 self._lock_connection = connection
             elif self.engine.dialect.name == "sqlite":
-                import fcntl
                 path = self.engine.url.database
                 if path and path != ":memory:":
-                    handle = open(path + "." + hashlib.sha256(self.scope.encode()).hexdigest()[:16] + ".lock", "a")
+                    handle = open(path + "." + hashlib.sha256(self.scope.encode()).hexdigest()[:16] + ".lock", "a+")
                     try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    except BlockingIOError:
+                        if sys.platform == "win32":
+                            import msvcrt
+                            handle.seek(0, 2)
+                            if handle.tell() == 0:
+                                handle.write("0")
+                                handle.flush()
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        else:
+                            import fcntl
+                            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except OSError:
                         raise RuntimeError("Another cycle is managing this portfolio") from None
             else:
                 raise RuntimeError("Portfolio locking supports PostgreSQL and SQLite only")
